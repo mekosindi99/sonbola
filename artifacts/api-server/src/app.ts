@@ -4,6 +4,7 @@ import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
 import path from "path";
+import fs from "fs";
 
 const app: Express = express();
 
@@ -50,5 +51,14 @@ app.use("/api/uploads", uploadsStatic);
 app.use("/uploads", uploadsStatic);
 
 app.use("/api", router);
+
+// Serve dashboard static files — fallback for all non-API routes
+const dashboardDist = path.join(process.cwd(), "artifacts", "dashboard", "dist", "public");
+if (fs.existsSync(dashboardDist)) {
+  app.use(express.static(dashboardDist));
+  app.get("*", (_req, res) => {
+    res.sendFile(path.join(dashboardDist, "index.html"));
+  });
+}
 
 export default app;
