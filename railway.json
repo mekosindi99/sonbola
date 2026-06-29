@@ -1,0 +1,1 @@
+{"build":{"buildCommand":"pnpm install --no-frozen-lockfile && pnpm --filter @workspace/api-server build"},"deploy":{"startCommand":"node artifacts/api-server/dist/index.mjs"}}
