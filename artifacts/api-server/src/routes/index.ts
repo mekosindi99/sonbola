@@ -1,0 +1,72 @@
+import { Router, type IRouter } from "express";
+import healthRouter from "./health";
+import settingsRouter from "./settings";
+import inventoryRouter from "./inventory";
+import bookingsRouter from "./bookings";
+import conversationsRouter from "./conversations";
+import statsRouter from "./stats";
+import webhookRouter from "./webhook";
+import savedRepliesRouter from "./saved-replies";
+import botTestRouter from "./bot-test";
+import adminRouter from "./admin";
+import storageRouter from "./storage";
+import facebookRouter from "./facebook";
+import usageRouter from "./usage";
+import metaRateLimitRouter from "./meta-rate-limit";
+import storefrontRouter from "./storefront";
+import blockedPhonesRouter from "./blocked-phones";
+import pushRouter from "./push";
+import themesRouter from "./themes";
+import beeRouter from "./bee";
+import fortuneRouter from "./fortune";
+import resetRouter from "./reset";
+import trainingChatRouter from "./training-chat";
+import suggestionsRouter from "./suggestions";
+import botFlowsRouter from "./bot-flows";
+import customerAuthRouter from "./customer-auth";
+import siteVisitorsRouter from "./site-visitors";
+import { receiptImageRouter } from "./receipt-image";
+import interactiveMenuRouter from "./interactive-menu";
+import botTrainingRouter from "./bot-training";
+
+const router: IRouter = Router();
+
+// Return the public webhook URL using server-side env var
+router.get("/webhook-url", (_req, res) => {
+  const rawDomain = process.env.LOCAL_DOMAIN || "localhost:3000";
+  const domain = rawDomain.split(",")[0].trim();
+  const url = domain ? `https://${domain}/api/webhook/meta` : null;
+  res.json({ webhookUrl: url });
+});
+
+router.use(storageRouter);
+router.use(healthRouter);
+router.use(settingsRouter);
+router.use(inventoryRouter);
+router.use(bookingsRouter);
+router.use(conversationsRouter);
+router.use(statsRouter);
+router.use(webhookRouter);
+router.use(savedRepliesRouter);
+router.use(botTestRouter);
+router.use(adminRouter);
+router.use(facebookRouter);
+router.use(usageRouter);
+router.use(metaRateLimitRouter);
+router.use(storefrontRouter);
+router.use(blockedPhonesRouter);
+router.use(pushRouter);
+router.use(themesRouter);
+router.use(beeRouter);
+router.use(fortuneRouter);
+router.use(resetRouter);
+router.use(trainingChatRouter);
+router.use(suggestionsRouter);
+router.use(botFlowsRouter);
+router.use("/customer", customerAuthRouter);
+router.use(siteVisitorsRouter);
+router.use("/public/receipt", receiptImageRouter);
+router.use(interactiveMenuRouter);
+router.use(botTrainingRouter);
+
+export default router;

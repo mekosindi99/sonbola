@@ -1,0 +1,788 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: AI Business Suite Automation System API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: settings
+    description: Bot settings and configuration
+  - name: inventory
+    description: Product inventory management
+  - name: bookings
+    description: Order and booking management
+  - name: conversations
+    description: Conversation and message management
+  - name: webhook
+    description: Meta webhook integration
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /settings:
+    get:
+      operationId: getSettings
+      tags: [settings]
+      summary: Get bot settings
+      responses:
+        "200":
+          description: Settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotSettings"
+    put:
+      operationId: updateSettings
+      tags: [settings]
+      summary: Update bot settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSettingsBody"
+      responses:
+        "200":
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotSettings"
+
+  /inventory:
+    get:
+      operationId: getInventory
+      tags: [inventory]
+      summary: Get all inventory items
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+            enum: [Summer, Winter, Spring, Girls, Boys]
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of inventory items
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InventoryItem"
+    post:
+      operationId: createInventoryItem
+      tags: [inventory]
+      summary: Create a new inventory item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInventoryItemBody"
+      responses:
+        "201":
+          description: Created item
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryItem"
+
+  /inventory/{id}:
+    get:
+      operationId: getInventoryItem
+      tags: [inventory]
+      summary: Get a single inventory item
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Inventory item
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryItem"
+        "404":
+          description: Not found
+    put:
+      operationId: updateInventoryItem
+      tags: [inventory]
+      summary: Update an inventory item
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateInventoryItemBody"
+      responses:
+        "200":
+          description: Updated item
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InventoryItem"
+    delete:
+      operationId: deleteInventoryItem
+      tags: [inventory]
+      summary: Delete an inventory item
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Deleted
+
+  /bookings:
+    get:
+      operationId: getBookings
+      tags: [bookings]
+      summary: Get all bookings
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, confirmed, completed, cancelled]
+        - name: starred
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: List of bookings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Booking"
+
+  /bookings/{id}:
+    get:
+      operationId: getBooking
+      tags: [bookings]
+      summary: Get a single booking
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Booking
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+    put:
+      operationId: updateBooking
+      tags: [bookings]
+      summary: Update a booking
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateBookingBody"
+      responses:
+        "200":
+          description: Updated booking
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+
+  /conversations:
+    get:
+      operationId: getConversations
+      tags: [conversations]
+      summary: Get all conversations
+      parameters:
+        - name: platform
+          in: query
+          schema:
+            type: string
+            enum: [facebook, instagram, all]
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, resolved, all]
+      responses:
+        "200":
+          description: List of conversations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ConversationSummary"
+
+  /conversations/{id}/messages:
+    get:
+      operationId: getConversationMessages
+      tags: [conversations]
+      summary: Get messages for a conversation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Message"
+
+  /webhook/meta:
+    get:
+      operationId: metaWebhookVerify
+      tags: [webhook]
+      summary: Meta webhook verification
+      parameters:
+        - name: hub.mode
+          in: query
+          schema:
+            type: string
+        - name: hub.verify_token
+          in: query
+          schema:
+            type: string
+        - name: hub.challenge
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Challenge response
+    post:
+      operationId: metaWebhookReceive
+      tags: [webhook]
+      summary: Receive Meta webhook events
+      responses:
+        "200":
+          description: OK
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [settings]
+      summary: Get dashboard statistics
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardStats"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required: [status]
+
+    BotSettings:
+      type: object
+      properties:
+        id:
+          type: integer
+        botEnabled:
+          type: boolean
+        facebookBotEnabled:
+          type: boolean
+        instagramBotEnabled:
+          type: boolean
+        shadowLearningEnabled:
+          type: boolean
+        schedulerEnabled:
+          type: boolean
+        scheduleStart:
+          type: string
+        scheduleEnd:
+          type: string
+        ageFilterMin:
+          type: integer
+        ageFilterMax:
+          type: integer
+        customAgeFilter:
+          type: string
+          nullable: true
+        facebookPageId:
+          type: string
+          nullable: true
+        instagramAccountId:
+          type: string
+          nullable: true
+        metaAccessToken:
+          type: string
+          nullable: true
+        whatsappAdminNumber:
+          type: string
+          nullable: true
+        webhookVerifyToken:
+          type: string
+          nullable: true
+        tokenExpiresAt:
+          type: integer
+          nullable: true
+        twilioAccountSid:
+          type: string
+          nullable: true
+        twilioAuthToken:
+          type: string
+          nullable: true
+        twilioFromNumber:
+          type: string
+          nullable: true
+        language:
+          type: string
+          enum: [ar, en, both]
+      required:
+        - id
+        - botEnabled
+        - facebookBotEnabled
+        - instagramBotEnabled
+        - shadowLearningEnabled
+        - schedulerEnabled
+        - scheduleStart
+        - scheduleEnd
+        - ageFilterMin
+        - ageFilterMax
+        - language
+
+    UpdateSettingsBody:
+      type: object
+      properties:
+        botEnabled:
+          type: boolean
+        facebookBotEnabled:
+          type: boolean
+        instagramBotEnabled:
+          type: boolean
+        shadowLearningEnabled:
+          type: boolean
+        schedulerEnabled:
+          type: boolean
+        scheduleStart:
+          type: string
+        scheduleEnd:
+          type: string
+        ageFilterMin:
+          type: integer
+        ageFilterMax:
+          type: integer
+        customAgeFilter:
+          type: string
+          nullable: true
+        facebookPageId:
+          type: string
+          nullable: true
+        instagramAccountId:
+          type: string
+          nullable: true
+        metaAccessToken:
+          type: string
+          nullable: true
+        whatsappAdminNumber:
+          type: string
+          nullable: true
+        webhookVerifyToken:
+          type: string
+          nullable: true
+        tokenExpiresAt:
+          type: integer
+          nullable: true
+        twilioAccountSid:
+          type: string
+          nullable: true
+        twilioAuthToken:
+          type: string
+          nullable: true
+        twilioFromNumber:
+          type: string
+          nullable: true
+        language:
+          type: string
+          enum: [ar, en, both]
+
+    InventoryItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        nameAr:
+          type: string
+        nameEn:
+          type: string
+        productId:
+          type: string
+        category:
+          type: string
+          enum: [Summer, Winter, Spring]
+        gender:
+          type: string
+          enum: [Girls, Boys, both]
+        ageMin:
+          type: integer
+        ageMax:
+          type: integer
+        price:
+          type: number
+        stock:
+          type: integer
+        descriptionAr:
+          type: string
+          nullable: true
+        descriptionEn:
+          type: string
+          nullable: true
+        imageUrl:
+          type: string
+          nullable: true
+        parentProductId:
+          type: string
+          nullable: true
+        colorVariantName:
+          type: string
+          nullable: true
+        colors:
+          type: string
+          nullable: true
+        available:
+          type: boolean
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required:
+        - id
+        - nameAr
+        - nameEn
+        - productId
+        - category
+        - ageMin
+        - ageMax
+        - price
+        - stock
+        - available
+        - createdAt
+        - updatedAt
+
+    CreateInventoryItemBody:
+      type: object
+      properties:
+        nameAr:
+          type: string
+        nameEn:
+          type: string
+        productId:
+          type: string
+        category:
+          type: string
+          enum: [Summer, Winter, Spring]
+        gender:
+          type: string
+          enum: [Girls, Boys, both]
+        ageMin:
+          type: integer
+        ageMax:
+          type: integer
+        price:
+          type: number
+        stock:
+          type: integer
+        descriptionAr:
+          type: string
+          nullable: true
+        descriptionEn:
+          type: string
+          nullable: true
+        imageUrl:
+          type: string
+          nullable: true
+        parentProductId:
+          type: string
+          nullable: true
+        colorVariantName:
+          type: string
+          nullable: true
+        colors:
+          type: string
+          nullable: true
+        available:
+          type: boolean
+      required:
+        - nameAr
+        - nameEn
+        - productId
+        - category
+        - ageMin
+        - ageMax
+        - price
+        - stock
+
+    UpdateInventoryItemBody:
+      type: object
+      properties:
+        nameAr:
+          type: string
+        nameEn:
+          type: string
+        productId:
+          type: string
+        category:
+          type: string
+          enum: [Summer, Winter, Spring]
+        gender:
+          type: string
+          enum: [Girls, Boys, both]
+        ageMin:
+          type: integer
+        ageMax:
+          type: integer
+        price:
+          type: number
+        stock:
+          type: integer
+        descriptionAr:
+          type: string
+          nullable: true
+        descriptionEn:
+          type: string
+          nullable: true
+        imageUrl:
+          type: string
+          nullable: true
+        parentProductId:
+          type: string
+          nullable: true
+        colorVariantName:
+          type: string
+          nullable: true
+        colors:
+          type: string
+          nullable: true
+        available:
+          type: boolean
+
+    Booking:
+      type: object
+      properties:
+        id:
+          type: integer
+        platform:
+          type: string
+          enum: [facebook, instagram]
+        senderId:
+          type: string
+        senderName:
+          type: string
+          nullable: true
+        phoneNumber:
+          type: string
+        governorate:
+          type: string
+        fullAddress:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BookingItem"
+        status:
+          type: string
+          enum: [pending, confirmed, completed, cancelled]
+        starred:
+          type: boolean
+        totalAmount:
+          type: number
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required:
+        - id
+        - platform
+        - senderId
+        - phoneNumber
+        - governorate
+        - fullAddress
+        - items
+        - status
+        - starred
+        - createdAt
+        - updatedAt
+
+    BookingItem:
+      type: object
+      properties:
+        productId:
+          type: string
+        nameAr:
+          type: string
+        nameEn:
+          type: string
+        quantity:
+          type: integer
+        price:
+          type: number
+      required:
+        - productId
+        - nameAr
+        - nameEn
+        - quantity
+        - price
+
+    UpdateBookingBody:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [pending, confirmed, completed, cancelled]
+        starred:
+          type: boolean
+        notes:
+          type: string
+          nullable: true
+
+    ConversationSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        platform:
+          type: string
+          enum: [facebook, instagram]
+        senderId:
+          type: string
+        senderName:
+          type: string
+          nullable: true
+        lastMessage:
+          type: string
+          nullable: true
+        lastMessageAt:
+          type: string
+          nullable: true
+        unreadCount:
+          type: integer
+        status:
+          type: string
+          enum: [active, resolved]
+        hasBooking:
+          type: boolean
+        isEscalated:
+          type: boolean
+      required:
+        - id
+        - platform
+        - senderId
+        - unreadCount
+        - status
+        - hasBooking
+        - isEscalated
+
+    Message:
+      type: object
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+        imageUrl:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+      required:
+        - id
+        - conversationId
+        - role
+        - content
+        - createdAt
+
+    DashboardStats:
+      type: object
+      properties:
+        totalConversations:
+          type: integer
+        activeConversations:
+          type: integer
+        totalBookings:
+          type: integer
+        pendingBookings:
+          type: integer
+        completedBookings:
+          type: integer
+        totalInventoryItems:
+          type: integer
+        botEnabled:
+          type: boolean
+        schedulerEnabled:
+          type: boolean
+        escalatedConversations:
+          type: integer
+      required:
+        - totalConversations
+        - activeConversations
+        - totalBookings
+        - pendingBookings
+        - completedBookings
+        - totalInventoryItems
+        - botEnabled
+        - schedulerEnabled
+        - escalatedConversations

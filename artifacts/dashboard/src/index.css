@@ -1,0 +1,198 @@
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&family=Outfit:wght@300;400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --font-sans: 'Outfit', sans-serif;
+  --font-arabic: 'Cairo', sans-serif;
+}
+
+:root {
+  /* Premium Dark Theme — medium dark (not pitch black) */
+  --background: 224 20% 13%;
+  --foreground: 213 31% 93%;
+  
+  --card: 222 20% 17%;
+  --card-foreground: 213 31% 93%;
+  
+  --popover: 224 20% 13%;
+  --popover-foreground: 215 20.2% 70%;
+  
+  /* Emerald Green Accent */
+  --primary: 152 69% 45%;
+  --primary-foreground: 0 0% 100%;
+  
+  /* Deep Blue Accent */
+  --secondary: 217 91% 60%;
+  --secondary-foreground: 0 0% 100%;
+  
+  --muted: 223 20% 21%;
+  --muted-foreground: 215.4 16.3% 62%;
+  
+  --accent: 216 20% 26%;
+  --accent-foreground: 210 40% 98%;
+  
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 98%;
+  
+  --border: 216 20% 26%;
+  --input: 216 20% 26%;
+  --ring: 152 69% 45%;
+  
+  --radius: 1rem;
+}
+
+/* Light Theme */
+html.light {
+  --background: 210 20% 98%;
+  --foreground: 224 71% 10%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 224 71% 10%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 224 71% 10%;
+
+  --primary: 152 69% 38%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 217 91% 55%;
+  --secondary-foreground: 0 0% 100%;
+
+  --muted: 210 16% 93%;
+  --muted-foreground: 215 14% 42%;
+
+  --accent: 210 16% 90%;
+  --accent-foreground: 224 71% 10%;
+
+  --destructive: 0 84% 55%;
+  --destructive-foreground: 0 0% 100%;
+
+  --border: 214 20% 87%;
+  --input: 214 20% 87%;
+  --ring: 152 69% 38%;
+}
+
+html.light .mesh-bg {
+  background-image:
+    radial-gradient(at 0% 0%, hsla(217, 91%, 60%, 0.06) 0px, transparent 50%),
+    radial-gradient(at 100% 100%, hsla(152, 69%, 45%, 0.06) 0px, transparent 50%);
+}
+
+html.light .glass-panel {
+  background: rgba(255,255,255,0.7);
+  border-color: rgba(0,0,0,0.07);
+  backdrop-filter: blur(20px);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased min-h-screen overflow-x-hidden;
+  }
+  
+  /* Apply different font based on direction */
+  html[dir="rtl"] body {
+    font-family: var(--font-arabic);
+  }
+  html[dir="ltr"] body {
+    font-family: var(--font-sans);
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-card/60 backdrop-blur-xl border border-white/5 shadow-2xl shadow-black/40;
+  }
+  
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary to-secondary;
+  }
+  
+  .mesh-bg {
+    background-image: 
+      radial-gradient(at 0% 0%, hsla(217, 91%, 60%, 0.1) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, hsla(152, 69%, 45%, 0.1) 0px, transparent 50%);
+  }
+}
+
+/* Custom Scrollbar for a premium feel */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: hsl(var(--background));
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted));
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--accent));
+}
+
+/* ── Button Animation Styles ────────────────────────────────────────────── */
+
+/* Glass Shimmer — white light swipe across the button */
+.btn-glass-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.btn-glass-shimmer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -80%;
+  width: 55%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255,255,255,0.18) 40%,
+    rgba(255,255,255,0.42) 50%,
+    rgba(255,255,255,0.18) 60%,
+    transparent 100%
+  );
+  transform: skewX(-12deg);
+  animation: glass-shimmer-sweep 2.8s ease-in-out infinite;
+  pointer-events: none;
+  border-radius: inherit;
+}
+@keyframes glass-shimmer-sweep {
+  0%   { transform: skewX(-12deg) translateX(0); }
+  100% { transform: skewX(-12deg) translateX(290%); }
+}
+
+/* Pulse — gentle breathing scale + glow */
+.btn-pulse {
+  animation: btn-pulse-breathe 2.2s ease-in-out infinite;
+  will-change: transform, filter;
+}
+@keyframes btn-pulse-breathe {
+  0%,  100% { transform: scale(1);     filter: brightness(1)   drop-shadow(0 6px 16px rgba(37,211,102,0.45)); }
+  50%        { transform: scale(1.032); filter: brightness(1.14) drop-shadow(0 8px 28px rgba(37,211,102,0.80)); }
+}
+
+/* ── Neon snake border: handled entirely in-component via SVG stroke-dashoffset ── */

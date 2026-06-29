@@ -1,0 +1,2159 @@
+import { Router, type IRouter } from "express";
+import { writeFile, mkdir, readFile } from "fs/promises";
+import { join, basename } from "path";
+import { db } from "@workspace/db";
+import {
+  settingsTable,
+  inventoryTable,
+  bookingsTable,
+  chatConversationsTable,
+  chatMessagesTable,
+  botTrainingNotesTable,
+  savedRepliesTable,
+  botSuggestionsTable,
+} from "@workspace/db/schema";
+import { eq, asc, desc, and, sql, ilike, or } from "drizzle-orm";
+import { openai } from "@workspace/integrations-openai-ai-server";
+import { randomUUID } from "crypto";
+import { ObjectStorageService } from "../lib/objectStorage";
+import { loadActiveFlow, executeFlow, isMidBooking } from "../lib/flow-engine";
+
+const objectStorageService = new ObjectStorageService();
+
+/**
+ * Download a Meta temporary image URL and upload to permanent object storage.
+ * Returns the permanent absolute URL and the base64 data (for Vision API).
+ * Meta URLs expire quickly — this MUST be called immediately on webhook receipt.
+ */
+async function mirrorMetaImage(metaUrl: string): Promise<{
+  permanentUrl: string;
+  base64: string;
+  contentType: string;
+} | null> {
+  try {
+    const resp = await fetch(metaUrl, { signal: AbortSignal.timeout(20_000) });
+    if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+
+    const contentType = resp.headers.get("content-type") || "image/jpeg";
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const base64 = buffer.toString("base64");
+
+    const uploadURL = await objectStorageService.getObjectEntityUploadURL();
+    const objectPath = objectStorageService.normalizeObjectEntityPath(uploadURL);
+
+    const putResp = await fetch(uploadURL, {
+      method: "PUT",
+      body: buffer,
+      headers: { "Content-Type": contentType },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!putResp.ok) throw new Error(`Upload failed: ${putResp.status}`);
+
+    const domain = (process.env.REPLIT_DOMAINS || "").split(",")[0].trim() || "localhost:8080";
+    const permanentUrl = `https://${domain}/api/storage${objectPath}`;
+
+    console.log(`[IMAGE] Mirrored Meta image → ${permanentUrl}`);
+    return { permanentUrl, base64, contentType };
+  } catch (err: any) {
+    console.error("[IMAGE] Failed to mirror Meta image:", err?.message || err);
+    return null;
+  }
+}
+
+const router: IRouter = Router();
+
+/* ══════════════════════════════════════════════════════════════════════
+ * SPEED CACHE — avoids repeated DB queries on every webhook
+ * TTL: settings 30s, static data (products/replies/notes) 60s
+ * ══════════════════════════════════════════════════════════════════════ */
+interface CacheEntry<T> { data: T; ts: number; }
+function makeCache<T>(ttlMs: number) {
+  let entry: CacheEntry<T> | null = null;
+  return {
+    get(): T | null { return entry && Date.now() - entry.ts < ttlMs ? entry.data : null; },
+    set(data: T) { entry = { data, ts: Date.now() }; },
+    invalidate() { entry = null; },
+  };
+}
+const settingsCache       = makeCache<any>(120_000);          // 2 min
+const productsCache       = makeCache<any[]>(24 * 3600_000);  // 24 hours — refreshed daily
+const repliesCache        = makeCache<any[]>(24 * 3600_000);  // 24 hours
+const notesCache          = makeCache<any[]>(24 * 3600_000);  // 24 hours
+const starredBookingCache = makeCache<any[]>(120_000);        // 2 min — avoid DB query per message
+
+// ── Warm up caches on startup (load products/replies/notes once immediately) ──
+// Runs async — does not block server start.
+async function warmupCaches() {
+  try {
+    const [prods, reps, notes] = await Promise.all([
+      db.select().from(inventoryTable).where(eq(inventoryTable.available, true)),
+      db.select().from(savedRepliesTable).where(eq(savedRepliesTable.isActive, true)).orderBy(asc(savedRepliesTable.id)),
+      db.select().from(botTrainingNotesTable).where(eq(botTrainingNotesTable.active, true)),
+    ]);
+    productsCache.set(prods);
+    repliesCache.set(reps);
+    notesCache.set(notes);
+    console.log(`[CACHE_WARMUP] ✓ Loaded ${prods.length} products, ${reps.length} replies, ${notes.length} notes`);
+  } catch (err: any) {
+    console.log(`[CACHE_WARMUP] ✗ ${err?.message}`);
+  }
+}
+setTimeout(warmupCaches, 2000); // 2s after module load so DB is ready
+
+// ── Work-hours config (Baghdad = UTC+3): active 08:00–23:59 local ──────────
+const OWNER_WHATSAPP = "07503981573"; // admin phone — off-hours redirect & invoice alerts
+const offHoursSentAt  = new Map<string, number>();  // senderId → last off-hours reply ts
+let _lastWorkStartDate = ""; // prevent duplicate 8am WhatsApp per day
+
+// Schedule: fire once daily at 08:00 Baghdad to send "اجيت" WhatsApp
+setInterval(async () => {
+  try {
+    const now    = new Date();
+    const baghdad = new Date(now.getTime() + 3 * 3600_000);
+    const h = baghdad.getUTCHours(), m = baghdad.getUTCMinutes();
+    const todayStr = baghdad.toISOString().slice(0, 10);
+    if (h === 8 && m === 0 && _lastWorkStartDate !== todayStr) {
+      _lastWorkStartDate = todayStr;
+      const rows = await db.select().from(settingsTable).limit(1).catch(() => []);
+      const stg = rows[0] as any;
+      if (stg?.twilioAccountSid && stg?.twilioAuthToken && stg?.twilioFromNumber) {
+        const toNum = `+964${OWNER_WHATSAPP.replace(/^0/, "")}`;
+        await sendTwilioAlert(stg.twilioAccountSid, stg.twilioAuthToken, stg.twilioFromNumber,
+          toNum, `🌅 اجيت — البوت شغال هسة`);
+        console.log("[WORK_HOURS] Sent 8am WhatsApp to owner");
+      }
+    }
+  } catch {}
+}, 60_000);
+
+/* ── Deduplication layer 1: in-memory MID cache (blocks same webhook delivered twice) ── */
+const processedMids = new Map<string, number>();
+const MID_TTL_MS = 10 * 60 * 1000; // 10 minutes
+function inMemoryDuplicate(mid: string): boolean {
+  const now = Date.now();
+  for (const [k, t] of processedMids) {
+    if (now - t > MID_TTL_MS) processedMids.delete(k);
+  }
+  if (processedMids.has(mid)) return true;
+  processedMids.set(mid, now);
+  return false;
+}
+
+/* ── Deduplication layer 1b: sender+content fingerprint (catches null-MID duplicates) ──
+ * Meta sometimes delivers webhooks without a MID (common on Instagram).
+ * When MID is null, Layers 1 and 2 are bypassed, so we need this fallback.
+ * Key = senderId + "|" + first 100 chars of message, Value = timestamp
+ */
+const processedFingerprints = new Map<string, number>();
+const FINGERPRINT_TTL_MS = 3 * 60 * 1000; // 3 minutes
+function inMemoryFingerprintDuplicate(senderId: string, text: string, imageFlag: boolean): boolean {
+  const now = Date.now();
+  for (const [k, t] of processedFingerprints) {
+    if (now - t > FINGERPRINT_TTL_MS) processedFingerprints.delete(k);
+  }
+  const fp = `${senderId}|${imageFlag ? "[img]" : ""}${(text || "").slice(0, 100)}`;
+  if (processedFingerprints.has(fp)) return true;
+  processedFingerprints.set(fp, now);
+  return false;
+}
+
+/* ── Per-sender sequential lock: ensures only ONE AI response is generated per sender at a time ──
+ * This prevents double-replies when Meta delivers the same webhook twice simultaneously,
+ * or when two messages arrive in rapid succession before the first AI call completes.
+ * Key = convId (platform_senderId), Value = promise chain for that sender.
+ */
+const senderProcessingLocks = new Map<string, Promise<void>>();
+function queueForSender(senderKey: string, fn: () => Promise<void>): void {
+  const prev = senderProcessingLocks.get(senderKey) ?? Promise.resolve();
+  const next = prev.then(() => fn()).catch(err => {
+    console.log(`[QUEUE_ERR] ${senderKey}: ${err?.message}`);
+  });
+  senderProcessingLocks.set(senderKey, next);
+  // Auto-cleanup: remove key once the chain settles so the Map doesn't grow forever
+  next.finally(() => {
+    if (senderProcessingLocks.get(senderKey) === next) senderProcessingLocks.delete(senderKey);
+  });
+}
+
+/* ── Deduplication layer 3: send-level guard (blocks identical reply to same user within 15s) ──
+ * This is the final safety net. Even if the message is processed twice (race condition, null mid,
+ * server restart, or Meta double-delivery), the SAME text will never be sent twice to the same
+ * recipient within the time window.
+ * Key = recipientId, Value = { hash of last sent content, timestamp }
+ */
+const recentlySentReplies = new Map<string, { hash: string; ts: number }>();
+const SEND_DEDUP_TTL_MS = 15 * 1000; // 15 seconds
+function isDuplicateSend(recipientId: string, content: string): boolean {
+  const now = Date.now();
+  const key = recipientId;
+  const entry = recentlySentReplies.get(key);
+  // Clean up old entries
+  for (const [k, v] of recentlySentReplies) {
+    if (now - v.ts > SEND_DEDUP_TTL_MS * 4) recentlySentReplies.delete(k);
+  }
+  if (entry && entry.hash === content && now - entry.ts < SEND_DEDUP_TTL_MS) {
+    return true;
+  }
+  recentlySentReplies.set(key, { hash: content, ts: now });
+  return false;
+}
+
+
+function isWithinSchedule(start: string, end: string): boolean {
+  const now = new Date();
+  const [startH, startM] = start.split(":").map(Number);
+  const [endH, endM] = end.split(":").map(Number);
+  const current = now.getHours() * 60 + now.getMinutes();
+  const startMins = startH * 60 + startM;
+  const endMins = endH * 60 + endM;
+  return current >= startMins && current <= endMins;
+}
+
+
+// ── Iraqi province detection & shipping cost lookup ──────────────────────────
+
+/** Arabic names for all 19 Iraqi governorates (+ common variants) */
+const IRAQI_PROVINCES_MAP: Record<string, string> = {
+  "بغداد": "بغداد",
+  "البصرة": "البصرة", "بصرة": "البصرة",
+  "نينوى": "نينوى", "الموصل": "نينوى", "موصل": "نينوى",
+  "أربيل": "أربيل", "اربيل": "أربيل", "إربيل": "أربيل",
+  "السليمانية": "السليمانية", "سليمانية": "السليمانية",
+  "كركوك": "كركوك",
+  "الأنبار": "الأنبار", "انبار": "الأنبار", "الانبار": "الأنبار",
+  "النجف": "النجف", "نجف": "النجف",
+  "كربلاء": "كربلاء",
+  "القادسية": "القادسية", "الديوانية": "القادسية", "ديوانية": "القادسية",
+  "ذي قار": "ذي قار", "ذيقار": "ذي قار", "الناصرية": "ذي قار",
+  "واسط": "واسط", "الكوت": "واسط",
+  "ميسان": "ميسان", "العمارة": "ميسان",
+  "المثنى": "المثنى", "السماوة": "المثنى",
+  "صلاح الدين": "صلاح الدين", "تكريت": "صلاح الدين",
+  "بابل": "بابل", "الحلة": "بابل",
+  "دهوك": "دهوك",
+  "حلبجة": "حلبجة",
+};
+
+/**
+ * Scans conversation history (newest-first) to find the customer's province.
+ * Returns the canonical province name if found, otherwise null.
+ */
+function extractProvince(history: Array<{ role: string; content: string }>): string | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "user") continue;
+    for (const [variant, canonical] of Object.entries(IRAQI_PROVINCES_MAP)) {
+      if (m.content.includes(variant)) return canonical;
+    }
+  }
+  return null;
+}
+
+/**
+ * Returns the shipping cost (IQD) for the given canonical province name,
+ * or null if not found.
+ */
+function getShippingCost(
+  province: string | null,
+  feesMap: Record<string, number>,
+): number | null {
+  if (!province || Object.keys(feesMap).length === 0) return null;
+  // Exact match
+  if (feesMap[province] !== undefined) return feesMap[province];
+  // Partial match (e.g. "البصرة" vs "بصرة")
+  for (const [key, cost] of Object.entries(feesMap)) {
+    if (province.includes(key) || key.includes(province)) return cost;
+  }
+  return null;
+}
+
+// ── Saved reply keyword match (pre-AI) ───────────────────────────────────────
+
+/**
+ * Normalises Arabic text for robust matching:
+ * • Collapses alef variants (أ إ آ) → ا
+ * • Normalises final ya (ى) → ي
+ * • Normalises ta-marbuta (ة) → ه
+ * • Strips all diacritics / harakat
+ * • Lower-cases and trims
+ */
+// ── Fix 1 + الحل الأمثل: Fuzzy normaliser for Iraqi dialect ──────────────────
+// Handles: ق↔گ↔ك, ة→ه, ى→ي, harakat, ch/p/g loanwords, common typos
+function normalizeArabic(text: string): string {
+  return text
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه")
+    .replace(/[\u064B-\u065F\u0670]/g, "") // strip harakat
+    .replace(/گ/g, "ك")          // Iraqi گ → ك (e.g. اشگد → اشكد)
+    .replace(/چ/g, "ج")          // Iraqi چ → ج
+    .replace(/پ/g, "ب")          // پ → ب
+    .replace(/ڤ/g, "ف")          // ڤ → ف
+    .replace(/ق/g, "ك")          // ق → ك (Iraqi dialect — "اشقد" = "اشكد")
+    .replace(/\s+/g, " ")        // collapse whitespace
+    .toLowerCase()
+    .trim();
+}
+
+/**
+ * Expand a single keyword into all dialectal variants for maximum match coverage.
+ * e.g. "اشقد" → ["اشقد","اشكد","اشگد","شقد","شكد"]
+ */
+function expandKeyword(kw: string): string[] {
+  const base = normalizeArabic(kw);
+  const variants = new Set<string>([base]);
+  // q↔k swaps on original (before normalisation merges them)
+  const withQ = kw.replace(/ك/g, "ق").replace(/گ/g, "ق");
+  const withK = kw.replace(/ق/g, "ك").replace(/گ/g, "ك");
+  variants.add(normalizeArabic(withQ));
+  variants.add(normalizeArabic(withK));
+  // Strip leading "ا" prefix variant (e.g. "اشكد" → "شكد")
+  if (base.startsWith("ا")) variants.add(base.slice(1));
+  return [...variants].filter(Boolean);
+}
+
+/**
+ * Returns the first saved reply whose triggerKeywords match the user text.
+ * Matching strategy (in order):
+ *   1. Exact normalised substring match
+ *   2. Dialectal expansion variants
+ *   3. Word-level token match (each word of user text vs each keyword)
+ * Returns null if no match.
+ */
+function getSavedReplyMatch(
+  userText: string,
+  replies: Array<{ triggerKeywords: string | null; replyAr: string; replyEn: string; isActive: boolean; titleAr: string }>,
+): { replyAr: string; replyEn: string; titleAr: string; matchedKeyword: string } | null {
+  const normText = normalizeArabic(userText);
+  if (!normText) return null;
+  // Tokenise user text for word-level matching
+  const userWords = normText.split(/\s+/);
+
+  for (const r of replies) {
+    if (!r.isActive || !r.triggerKeywords) continue;
+    const rawKws = r.triggerKeywords.split(",").map(k => k.trim()).filter(Boolean);
+    for (const rawKw of rawKws) {
+      const variants = expandKeyword(rawKw);
+      for (const v of variants) {
+        // 1. Substring match in full normalised text
+        if (normText.includes(v)) return { ...r, matchedKeyword: rawKw };
+        // 2. Whole-word token match (handles "بكم" matching "بكم الطقم")
+        if (userWords.some(w => w === v || w.startsWith(v) || v.startsWith(w) && v.length >= 3)) {
+          return { ...r, matchedKeyword: rawKw };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+const META_API_VERSION = "v21.0";
+
+// Resolve the correct Meta API actor ID for sending messages:
+// - Facebook: pageId
+// - Instagram: instagramAccountId (if available), fallback to pageId
+function resolveMetaActorId(platform: string, pageId: string, _instagramAccountId?: string | null): string {
+  // Always use Page ID as actor — Messenger Platform handles both FB and IG DMs via /{page-id}/messages
+  return pageId;
+}
+
+async function sendMetaMessage(recipientId: string, pageId: string, accessToken: string, message: string, platform: string, instagramAccountId?: string | null, instagramAccessToken?: string | null) {
+  // Layer 3 dedup: block identical reply to same recipient within 15 seconds
+  if (isDuplicateSend(recipientId, message)) {
+    console.log(`[SEND_DEDUP] Blocked duplicate reply to ${recipientId}: "${message.slice(0, 60)}"`);
+    return;
+  }
+
+  const actorId = resolveMetaActorId(platform, pageId, instagramAccountId);
+  const effectiveToken = accessToken; // Always use Page Access Token — Messenger Platform uses /{page-id}/messages for both FB and IG
+  const baseUrl = `https://graph.facebook.com/${META_API_VERSION}/${actorId}/messages`;
+  console.log(`[META_SEND] platform=${platform} actor=${actorId} recipient=${recipientId} tokenType=page`);
+
+  try {
+    const res = await fetch(`${baseUrl}?access_token=${effectiveToken}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: recipientId },
+        message: { text: message },
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.log(`[META_SEND_ERR] status=${res.status} body=${errBody.slice(0, 300)}`);
+    } else {
+      console.log(`[META_SEND_OK] Sent to ${recipientId} via ${platform}`);
+    }
+  } catch (err: any) {
+    console.log(`[META_SEND_FAIL] ${err?.message}`);
+  }
+}
+
+/**
+ * Ensures the given image URL is an absolute public URL that Meta servers can fetch.
+ * - If already https:// → use as-is
+ * - If relative (/uploads/... or /api/storage/...) → prefix with the Replit public domain
+ * Returns null if the URL cannot be resolved to an absolute public form.
+ */
+function ensureAbsoluteImageUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  if (url.startsWith("https://") || url.startsWith("http://")) return url;
+  const rawDomain = (process.env.REPLIT_DOMAINS || process.env.REPLIT_DEV_DOMAIN || "").split(",")[0].trim();
+  if (!rawDomain) {
+    console.log(`[IMG_URL] Cannot resolve relative path "${url.slice(0, 80)}" — no REPLIT_DOMAINS set`);
+    return null;
+  }
+  const path = url.startsWith("/") ? url : `/${url}`;
+  return `https://${rawDomain}${path}`;
+}
+
+async function sendMetaImage(recipientId: string, pageId: string, accessToken: string, imageUrl: string, platform: string, instagramAccountId?: string | null, _instagramAccessToken?: string | null) {
+  // Ensure Meta servers can fetch the image — must be an absolute public URL
+  const absoluteUrl = ensureAbsoluteImageUrl(imageUrl);
+  if (!absoluteUrl) {
+    const errMsg = `[MEDIA_SEND_FAIL] Cannot resolve image URL to absolute: "${imageUrl.slice(0, 120)}"`;
+    console.log(errMsg);
+    throw new Error(errMsg);
+  }
+
+  const actorId = resolveMetaActorId(platform, pageId, instagramAccountId);
+  const effectiveToken = accessToken; // Always use Page Access Token
+  const baseUrl = `https://graph.facebook.com/${META_API_VERSION}/${actorId}/messages`;
+
+  try {
+    const res = await fetch(`${baseUrl}?access_token=${effectiveToken}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: recipientId },
+        message: { attachment: { type: "image", payload: { url: absoluteUrl, is_reusable: true } } },
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      const errMsg = `[MEDIA_SEND_FAIL] HTTP ${res.status} sending image to ${recipientId} | url=${imageUrl.slice(0, 120)} | meta_error=${errBody.slice(0, 400)}`;
+      console.log(errMsg);
+      throw new Error(errMsg);
+    }
+    const resData = await res.json().catch(() => ({})) as any;
+    if (resData?.message_id) {
+      console.log(`[META_IMG_OK] Sent to ${recipientId} | message_id=${resData.message_id}`);
+    }
+  } catch (err: any) {
+    // Re-throw so callers can detect failure and log [MEDIA_SEND_FAIL]
+    if (!err?.message?.startsWith("[MEDIA_SEND_FAIL]")) {
+      console.log(`[MEDIA_SEND_FAIL] Network error sending image to ${recipientId} | url=${imageUrl.slice(0, 120)} | ${err?.message}`);
+    }
+    throw err;
+  }
+}
+
+
+/* ── Fetch recent conversation messages from Meta API (safety-net for sparse DB history) ──
+ * Used when our DB has < 8 messages for a sender, meaning the bot may have just started
+ * tracking or the sender previously chatted without the bot. This fills context gaps.
+ */
+async function fetchMetaHistory(
+  senderId: string, pageId: string, accessToken: string, platform: string, limit: number,
+): Promise<Array<{ role: "user" | "assistant"; content: string }>> {
+  try {
+    const userParam = platform === "instagram" ? "instagram_id" : "user_id";
+    const url = `https://graph.facebook.com/v21.0/me/conversations` +
+      `?${userParam}=${senderId}` +
+      `&fields=messages.limit(${limit}){message,from,created_time}` +
+      `&access_token=${accessToken}`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json() as any;
+    const conv = data?.data?.[0];
+    if (!conv?.messages?.data) return [];
+    // Meta returns messages newest-first; reverse to get chronological order
+    const msgs: any[] = [...conv.messages.data].reverse();
+    return msgs
+      .map((m: any) => ({
+        role: (m.from?.id === pageId ? "assistant" : "user") as "user" | "assistant",
+        content: (m.message || "").trim(),
+      }))
+      .filter((m) => m.content.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function parseSendProductsTag(reply: string): { cleanReply: string; productIds: string[] | null } {
+  const match = reply.match(/\[SEND_PRODUCTS:([^\]]+)\]/i);
+  if (!match) return { cleanReply: reply, productIds: null };
+  const cleanReply = reply.replace(/\[SEND_PRODUCTS:[^\]]+\]/gi, "").trim();
+  const ids = match[1].split(",").map((s: string) => s.trim()).filter(Boolean);
+  return { cleanReply, productIds: ids.length > 0 ? ids : null };
+}
+
+/**
+ * Senders for which the bot is deactivated (admin/service mode).
+ * Populated from DB isEscalated=true on first message; persists per process restart.
+ */
+const deactivatedSenders = new Set<string>();
+
+/** Bot message phrases that signal admin handover — trigger bot deactivation */
+const COMPLAINT_HANDOVER_PHRASES = [
+  "دزيت المشكلة لموظف المخزن",
+  "رح يتواصل وياج مباشرة",
+  "رح تتواصل وياج الإدارة",
+];
+
+function isComplaintHandover(reply: string): boolean {
+  return COMPLAINT_HANDOVER_PHRASES.some(p => reply.includes(p));
+}
+
+/** Format price as human shorthand: 25000 → "25"  /  15500 → "15" */
+function formatShorthandPrice(price: number | null | undefined): string {
+  if (!price || price <= 0) return "غير متوفر";
+  return price >= 1000 ? `${Math.round(price / 1000)}` : `${Math.round(price)}`;
+}
+
+/** Mark conversation as seen in Meta inbox so it clears from unread */
+async function markMetaSeen(
+  recipientId: string, pageId: string, accessToken: string,
+): Promise<void> {
+  try {
+    await fetch(
+      `https://graph.facebook.com/${META_API_VERSION}/${pageId}/messages?access_token=${accessToken}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recipient: { id: recipientId }, sender_action: "mark_seen" }),
+      },
+    );
+  } catch { /* non-critical */ }
+}
+
+/**
+ * Fetch customer's Facebook/Instagram profile picture URL via Meta Graph API v19.0.
+ * Logs the full API response so we can diagnose permission issues.
+ * Returns the picture URL string, or null on failure.
+ */
+async function getMetaProfilePic(senderId: string, accessToken: string): Promise<string | null> {
+  try {
+    // Primary: fields=profile_pic on the PSID (v19.0 forced as required)
+    const primaryUrl = `https://graph.facebook.com/v19.0/${senderId}?fields=profile_pic&access_token=${accessToken}`;
+    const res = await fetch(primaryUrl, { signal: AbortSignal.timeout(8_000) });
+    const data = await res.json() as any;
+    console.log(`[PROFILE_PIC] Primary response for ${senderId}: ${JSON.stringify(data).slice(0, 300)}`);
+    if (data?.profile_pic) {
+      console.log(`[PROFILE_PIC] ✓ Got profile_pic for ${senderId}`);
+      return data.profile_pic as string;
+    }
+    // Fallback A: /picture?type=large&redirect=false
+    const picRes = await fetch(
+      `https://graph.facebook.com/v19.0/${senderId}/picture?type=large&redirect=false&access_token=${accessToken}`,
+      { signal: AbortSignal.timeout(8_000) },
+    );
+    const picData = await picRes.json() as any;
+    console.log(`[PROFILE_PIC] Fallback-A picture response: ${JSON.stringify(picData).slice(0, 200)}`);
+    if (picData?.data?.url) {
+      console.log(`[PROFILE_PIC] ✓ Got picture URL via fallback-A for ${senderId}`);
+      return picData.data.url as string;
+    }
+    console.log(`[PROFILE_PIC] ✗ No profile pic found for ${senderId} — check pages_messaging permission`);
+    return null;
+  } catch (err: any) {
+    console.log(`[PROFILE_PIC] ✗ Exception for ${senderId}: ${err?.message}`);
+    return null;
+  }
+}
+
+/**
+ * Download image bytes from any URL (including Meta auth-gated URLs).
+ * Returns Buffer + content-type, or null on failure.
+ */
+async function downloadImageBuffer(url: string): Promise<{ buffer: Buffer; contentType: string } | null> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(12_000) });
+    if (!res.ok) {
+      console.log(`[DOWNLOAD] HTTP ${res.status} for ${url.slice(0, 80)}`);
+      return null;
+    }
+    const ct = res.headers.get("content-type") || "image/jpeg";
+    const buf = Buffer.from(await res.arrayBuffer());
+    console.log(`[DOWNLOAD] ✓ ${buf.length} bytes, type=${ct} from ${url.slice(0, 80)}`);
+    return { buffer: buf, contentType: ct };
+  } catch (err: any) {
+    console.log(`[DOWNLOAD] ✗ ${err?.message} for ${url.slice(0, 80)}`);
+    return null;
+  }
+}
+
+interface TelegramMediaItem {
+  buffer: Buffer;
+  contentType: string;
+  label: string; // attach name used in FormData
+}
+
+/**
+ * Send multiple images as a Telegram media group.
+ * Caption (HTML) goes on the first photo only.
+ * Falls back to sendPhoto if only one image.
+ */
+async function sendTelegramMediaGroup(
+  botToken: string, chatId: string,
+  images: TelegramMediaItem[],
+  caption: string,
+): Promise<boolean> {
+  if (images.length === 0) return false;
+
+  try {
+    const form = new FormData();
+    form.append("chat_id", chatId);
+
+    const mediaArray = images.map((img, i) => {
+      const obj: Record<string, string> = { type: "photo", media: `attach://${img.label}` };
+      if (i === 0) { obj.caption = caption; obj.parse_mode = "HTML"; }
+      return obj;
+    });
+    form.append("media", JSON.stringify(mediaArray));
+
+    for (const img of images) {
+      const ext = img.contentType.includes("png") ? "png" : "jpg";
+      const blob = new Blob([img.buffer], { type: img.contentType });
+      form.append(img.label, blob, `${img.label}.${ext}`);
+    }
+
+    const endpoint = images.length === 1 ? "sendPhoto" : "sendMediaGroup";
+    // For sendPhoto we need different field name
+    if (images.length === 1) {
+      const form2 = new FormData();
+      form2.append("chat_id", chatId);
+      form2.append("caption", caption);
+      form2.append("parse_mode", "HTML");
+      const ext = images[0].contentType.includes("png") ? "png" : "jpg";
+      form2.append("photo", new Blob([images[0].buffer], { type: images[0].contentType }), `photo.${ext}`);
+      const r = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+        method: "POST", body: form2, signal: AbortSignal.timeout(30_000),
+      });
+      const d = await r.json() as any;
+      if (d.ok) { console.log(`[TELEGRAM] ✓ sendPhoto ok`); return true; }
+      console.log(`[TELEGRAM] ✗ sendPhoto: ${JSON.stringify(d).slice(0, 200)}`);
+      return false;
+    }
+
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/${endpoint}`, {
+      method: "POST", body: form, signal: AbortSignal.timeout(40_000),
+    });
+    const data = await res.json() as any;
+    if (data.ok) {
+      console.log(`[TELEGRAM] ✓ ${endpoint} sent ${images.length} photos`);
+      return true;
+    }
+    console.log(`[TELEGRAM] ✗ ${endpoint} failed: ${JSON.stringify(data).slice(0, 300)}`);
+    return false;
+  } catch (err: any) {
+    console.log(`[TELEGRAM] ✗ mediaGroup exception: ${err?.message}`);
+    return false;
+  }
+}
+
+/**
+ * Mark a Facebook conversation as "Follow Up" (⭐ star) in Meta Business Suite.
+ * Step 1: Fetch conversation ID via /{pageId}/conversations?user_id={senderId}
+ * Step 2: POST /{conversationId}/labels  with access_token in query string.
+ * Logs the full Meta API error message so missing permissions are visible.
+ */
+async function starMetaConversation(
+  senderId: string, pageId: string, accessToken: string,
+): Promise<void> {
+  try {
+    // Step 1: resolve conversation ID
+    const convUrl = `https://graph.facebook.com/v19.0/${pageId}/conversations?user_id=${senderId}&fields=id&access_token=${accessToken}`;
+    const convRes = await fetch(convUrl, { signal: AbortSignal.timeout(8_000) });
+    const convData = await convRes.json() as any;
+    console.log(`[STAR] Conversations lookup for sender ${senderId}: ${JSON.stringify(convData).slice(0, 300)}`);
+
+    const convId = convData?.data?.[0]?.id;
+    if (!convId) {
+      console.log(`[STAR] ✗ No conversation found — Meta error: ${JSON.stringify(convData?.error || convData).slice(0, 300)}`);
+      return;
+    }
+
+    // Step 2: apply follow_up label — access_token in query string (not body)
+    const labelUrl = `https://graph.facebook.com/v19.0/${convId}/labels?access_token=${accessToken}`;
+    const labelRes = await fetch(labelUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: "follow_up" }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    const labelData = await labelRes.json() as any;
+    console.log(`[STAR] Label POST for conv ${convId}: ${JSON.stringify(labelData).slice(0, 300)}`);
+    if (labelData?.success) {
+      console.log(`[STAR] ✓ Conversation ${convId} starred as Follow Up in Business Suite`);
+    } else {
+      console.log(`[STAR] ✗ Label failed — Meta error: ${JSON.stringify(labelData?.error || labelData).slice(0, 300)}`);
+    }
+  } catch (err: any) {
+    console.log(`[STAR] ✗ Exception: ${err?.message}`);
+  }
+}
+
+interface IdentifyResult {
+  productId: string;
+  code: string;
+  name: string;
+  price: number;
+  imageUrl?: string;
+}
+
+/** Returns true if current Baghdad time is within bot working hours (08:00–23:59) */
+function isBotActiveHours(): boolean {
+  const now = new Date();
+  const baghdadHour = (now.getUTCHours() + 3) % 24;
+  return baghdadHour >= 8; // inactive midnight–07:59
+}
+
+/**
+ * Send a Telegram message to admin via Bot API.
+ * @returns true if the message was delivered successfully
+ */
+async function sendTelegramNotification(
+  botToken: string, chatId: string, message: string,
+  inlineKeyboard?: Array<Array<{ text: string; url: string }>>,
+): Promise<boolean> {
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const body: Record<string, any> = { chat_id: chatId, text: message, parse_mode: "HTML" };
+    if (inlineKeyboard) body.reply_markup = { inline_keyboard: inlineKeyboard };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await res.json() as any;
+    if (data.ok) {
+      console.log(`[TELEGRAM] Message sent to chat ${chatId}`);
+      return true;
+    } else {
+      console.log(`[TELEGRAM] Send failed: ${data.description}`);
+      return false;
+    }
+  } catch (err: any) {
+    console.log(`[TELEGRAM] Error: ${err?.message}`);
+    return false;
+  }
+}
+
+/**
+ * Build the standard dual-link inline keyboard for a conversation.
+ * Vertical layout:
+ *   [Business Suite 🖥️]
+ *   [Messenger App 📱]
+ */
+function buildConvButtons(psid: string): Array<Array<{ text: string; url: string }>> {
+  return [
+    [{ text: "فتح المحادثة في Business Suite 🖥️", url: `https://business.facebook.com/latest/inbox/messenger?selected_item_id=${psid}` }],
+    [{ text: "فتح في ماسنجر (m.me) 📱", url: `https://m.me/${psid}` }],
+  ];
+}
+
+/**
+ * Send a standalone Telegram message that contains only the conversation links
+ * as inline buttons. Used after media groups (which don't support reply_markup).
+ */
+async function sendTelegramButtons(botToken: string, chatId: string, psid: string, label = "─── روابط المحادثة ───"): Promise<void> {
+  try {
+    await sendTelegramNotification(botToken, chatId, label, buildConvButtons(psid));
+  } catch {/* non-critical */}
+}
+
+// ── Smart Suggest helpers ────────────────────────────────────────────────────
+
+const VISION_BATCH_SIZE = 10; // Max suggestion images per GPT-4o call
+
+/**
+ * Load a suggestion image as base64, either from disk (local /uploads/ path)
+ * or by downloading from an absolute URL.
+ */
+async function loadSuggestionImage(imageUrl: string): Promise<{ base64: string; ct: string } | null> {
+  try {
+    if (imageUrl.startsWith("http")) {
+      const res = await fetch(imageUrl, { signal: AbortSignal.timeout(12_000) });
+      if (!res.ok) return null;
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct = res.headers.get("content-type") || "image/jpeg";
+      return { base64: buf.toString("base64"), ct };
+    } else {
+      // local file: imageUrl = /uploads/suggestions/uuid.jpg — use basename to prevent traversal
+      const safeName = basename(imageUrl);
+      if (!safeName || safeName.startsWith(".")) return null;
+      const filePath = join(process.cwd(), "public", "uploads", "suggestions", safeName);
+      const buf = await readFile(filePath);
+      const ct = safeName.endsWith(".png") ? "image/png" : "image/jpeg";
+      return { base64: buf.toString("base64"), ct };
+    }
+  } catch (err: any) {
+    console.log(`[SUGGEST] loadSuggestionImage error for ${imageUrl.slice(0, 60)}: ${err?.message}`);
+    return null;
+  }
+}
+
+/**
+ * Read the product code printed on a customer's image (e.g. "S380").
+ * Returns the code in uppercase or null if none detected.
+ */
+async function extractCodeFromCustomerImage(base64: string, contentType: string): Promise<string | null> {
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "What is the product/item code visible on this image? (e.g. S380, S391, S-380). Return ONLY the code in uppercase (like S380), or 'NONE' if no code is visible." },
+          { type: "image_url", image_url: { url: `data:${contentType};base64,${base64}`, detail: "high" } },
+        ],
+      }],
+      max_completion_tokens: 15,
+      temperature: 0,
+    });
+    const code = (resp.choices[0]?.message?.content || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+    if (!code || code === "NONE" || code.length > 15) return null;
+    return code;
+  } catch { return null; }
+}
+
+/**
+ * Scenario A: Search suggestion images for a specific product code using Vision AI.
+ * Processes images in batches of VISION_BATCH_SIZE.
+ * Returns the matched suggestion imageUrl and price text (read from the image), or null.
+ */
+async function findSuggestionByCode(
+  code: string,
+  suggestions: Array<{ id: number; imageUrl: string }>,
+): Promise<{ imageUrl: string; priceText: string } | null> {
+  for (let start = 0; start < suggestions.length; start += VISION_BATCH_SIZE) {
+    const batch = suggestions.slice(start, start + VISION_BATCH_SIZE);
+    const loaded = await Promise.all(batch.map(s => loadSuggestionImage(s.imageUrl)));
+
+    const content: any[] = [{
+      type: "text",
+      text: `هذه ${batch.length} صور منتجات. اقرأ الكود المكتوب على كل صورة وأخبرني: هل كود "${code}" موجود في أي منها (بما فيها أشكال مثل ${code.replace(/^S/, "S-")} أو ${code.toLowerCase()})؟\nأجب بـ JSON فقط: {"foundIndex": رقم من 0 إلى ${batch.length - 1} أو -1 إذا لم يوجد, "price": "السعر المكتوب على الصورة أو null"}`,
+    }];
+
+    for (let i = 0; i < batch.length; i++) {
+      if (!loaded[i]) continue;
+      content.push({ type: "text", text: `صورة ${i}:` });
+      content.push({ type: "image_url", image_url: { url: `data:${loaded[i]!.ct};base64,${loaded[i]!.base64}`, detail: "high" } });
+    }
+
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content }],
+        max_completion_tokens: 60,
+        temperature: 0,
+      });
+      const raw = (resp.choices[0]?.message?.content || "").trim().replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(raw);
+      const idx = Number(parsed.foundIndex ?? -1);
+      if (idx >= 0 && idx < batch.length) {
+        const match = batch[idx];
+        const priceText = parsed.price && parsed.price !== "null" ? String(parsed.price) : "—";
+        console.log(`[SUGGEST] Scenario A: code ${code} found in suggestion id=${match.id}, price=${priceText}`);
+        return { imageUrl: match.imageUrl, priceText };
+      }
+    } catch (err: any) {
+      console.log(`[SUGGEST] findSuggestionByCode parse error batch${start}: ${err?.message}`);
+    }
+  }
+  return null;
+}
+
+/**
+ * Scenario B: Find suggestion images whose printed age range(s) cover the given age in months.
+ * Each image may have MULTIPLE age stickers — the image matches if the target age falls into ANY
+ * of its detected ranges (logical OR). Processes images in batches.
+ */
+async function findSuggestionsByAge(
+  ageMonths: number,
+  suggestions: Array<{ id: number; imageUrl: string }>,
+): Promise<Array<{ id: number; imageUrl: string }>> {
+  const results: Array<{ id: number; imageUrl: string }> = [];
+  const ageYears = (ageMonths / 12).toFixed(1);
+
+  for (let start = 0; start < suggestions.length; start += VISION_BATCH_SIZE) {
+    const batch = suggestions.slice(start, start + VISION_BATCH_SIZE);
+    const loaded = await Promise.all(batch.map(s => loadSuggestionImage(s.imageUrl)));
+
+    const content: any[] = [{
+      type: "text",
+      text: `هذه ${batch.length} صور ملابس أطفال. كل صورة قد تحتوي على ستيكر أو أكثر يذكر نطاق عمر مناسب.
+قواعد مهمة:
+1. ابحث عن كل ستيكرات العمر الموجودة على كل صورة — قد تكون أكثر من ستيكر واحد.
+2. حوّل كل نطاق إلى أشهر: 6M=6 أشهر، 1سنة=12، 2سنة=24، 3سنة=36، إلخ.
+3. الصورة تعتبر مطابقة إذا كان العمر المطلوب يقع ضمن أي نطاق من نطاقاتها (OR logic).
+العمر المطلوب: ${ageMonths} شهراً (حوالي ${ageYears} سنة).
+
+أجب بـ JSON فقط بهذا الشكل الدقيق:
+{
+  "images": [
+    {"index": 0, "ranges": [{"from": 6, "to": 24}, {"from": 36, "to": 48}], "matches": true},
+    {"index": 1, "ranges": [{"from": 12, "to": 36}], "matches": false}
+  ]
+}
+حيث "matches" = true إذا كان ${ageMonths} شهراً يقع بين "from" و"to" لأي نطاق من النطاقات.`,
+    }];
+
+    for (let i = 0; i < batch.length; i++) {
+      if (!loaded[i]) continue;
+      content.push({ type: "text", text: `صورة ${i}:` });
+      content.push({ type: "image_url", image_url: { url: `data:${loaded[i]!.ct};base64,${loaded[i]!.base64}`, detail: "low" } });
+    }
+
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content }],
+        max_completion_tokens: 400,
+        temperature: 0,
+      });
+      const raw = (resp.choices[0]?.message?.content || "").trim().replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(raw);
+      const images: Array<{ index: number; ranges: Array<{ from: number; to: number }>; matches: boolean }> =
+        Array.isArray(parsed.images) ? parsed.images : [];
+
+      for (const img of images) {
+        if (!img.matches) continue;
+        const idx = Number(img.index);
+        if (idx >= 0 && idx < batch.length) {
+          const rangesStr = (img.ranges || []).map((r: any) => `${r.from}-${r.to}m`).join(", ");
+          console.log(`[SUGGEST] Scenario B: image idx=${idx} id=${batch[idx].id} ranges=[${rangesStr}] matches ageMonths=${ageMonths}`);
+          results.push(batch[idx]);
+        }
+      }
+    } catch (err: any) {
+      console.log(`[SUGGEST] findSuggestionsByAge parse error batch${start}: ${err?.message}`);
+    }
+  }
+
+  console.log(`[SUGGEST] Scenario B: found ${results.length} suggestion(s) for ageMonths=${ageMonths}`);
+  return results;
+}
+
+/* ── Twilio WhatsApp alert ── */
+async function sendTwilioAlert(
+  accountSid: string, authToken: string, fromNumber: string,
+  toNumber: string, message: string,
+): Promise<void> {
+  try {
+    const from = fromNumber.startsWith("whatsapp:") ? fromNumber : `whatsapp:${fromNumber}`;
+    const to = toNumber.startsWith("whatsapp:") ? toNumber : `whatsapp:${toNumber}`;
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ From: from, To: to, Body: message }).toString(),
+    });
+    const data = await res.json() as any;
+    if (!res.ok) {
+      console.log(`[TWILIO] Send failed: ${data?.message || res.status}`);
+    } else {
+      console.log(`[TWILIO] Alert sent to ${toNumber}: SID=${data.sid}`);
+    }
+  } catch (err: any) {
+    console.log(`[TWILIO] Error: ${err?.message}`);
+  }
+}
+
+// ── Detect booking confirmation and auto-create booking record ──────────────
+const BOOKING_CONFIRM_KEYWORDS = [
+  // exact phrases the bot actually generates
+  "تم تسجيل الطلبية", "تم تسجيل طلبيتك", "تم تسجيل طلبك",
+  "سجلت الطلبية", "سجلنا طلبك", "سجلنا طلبيتك",
+  "استلمنا طلبك", "وصلنا طلبك", "تم استلام طلبك",
+  "تم الحجز بنجاح عيني", "تم الحجز", "تأكيد الطلب", "مبروك",
+  "المجموع الكلي", "سيوصل الطلب", "سيوصلك الطلب", "يوصل خلال",
+  "راح نتواصل", "سيتم التواصل",
+  "booking confirmed", "order confirmed",
+];
+
+function isBookingConfirmation(reply: string): boolean {
+  const lower = reply.toLowerCase();
+  return BOOKING_CONFIRM_KEYWORDS.some(k => lower.includes(k.toLowerCase()));
+}
+
+async function tryAutoCreateBooking(
+  convId: string,
+  platform: string,
+  senderId: string,
+  messages: Array<{ role: string; content: string }>,
+  settings?: any,
+  overrides?: { phone?: string; address?: string }, // Fix C: inject known values to prevent old-history pollution
+) {
+  try {
+    // Session isolation: prevent duplicate booking within last 3 minutes
+    // (do NOT block permanently via hasBooking — customers can place multiple orders)
+    const recentBooking = await db.select({ id: bookingsTable.id, createdAt: bookingsTable.createdAt })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.senderId, senderId))
+      .orderBy(desc(bookingsTable.createdAt))
+      .limit(1);
+    if (recentBooking[0]?.createdAt) {
+      const ageMs = Date.now() - new Date(recentBooking[0].createdAt).getTime();
+      if (ageMs < 3 * 60 * 1000) {
+        console.log(`[BOOKING] Skipping — duplicate within 3 min for ${senderId}`);
+        return;
+      }
+    }
+
+    // Fetch conversation for senderName update later
+    const existing = await db.select()
+      .from(chatConversationsTable)
+      .where(eq(chatConversationsTable.id, convId))
+      .limit(1);
+
+    // ── Extract customer info via GPT ──────────────────────────────────
+    const convoText = messages
+      .filter(m => !m.content.startsWith("[image]"))
+      .slice(-20)
+      .map(m => `${m.role === "user" ? "زبون" : "بوت"}: ${m.content}`)
+      .join("\n");
+
+    const extractReply = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{
+        role: "user",
+        content: `من هذه المحادثة، استخرج معلومات الحجز بتنسيق JSON فقط:
+${convoText}
+
+أجب بهذا التنسيق الدقيق:
+{"phone":"رقم_الهاتف","governorate":"المحافظة","address":"العنوان_الكامل","senderName":"اسم_الزبون","productCode":"كود_الموديل","productName":"اسم_المنتج","quantity":1,"unitPrice":0}
+
+قواعد مهمة:
+- إذا المعلومة غير موجودة استخدم null (بدون أقواس - JSON null حقيقي)
+- لا تستخدم كلمة "null" بين أقواس
+- للسعر: اكتب الرقم فقط بدون كلمة "ألف" (مثال: 30000 بدل "30 ألف")
+- أجب بـ JSON فقط بدون أي نص آخر`,
+      }],
+      max_completion_tokens: 300,
+      response_format: { type: "json_object" },
+    });
+
+    const raw = extractReply.choices[0]?.message?.content ?? "{}";
+    let info: { phone?: string | null; governorate?: string | null; address?: string | null; senderName?: string | null; productCode?: string | null; productName?: string | null; quantity?: number | null; unitPrice?: number | null } = {};
+    try { info = JSON.parse(raw); } catch { return; }
+
+    const clean = (v: string | null | undefined) => (!v || v === "null" || v === "غير محدد" || v === "غير معروف" || v === "0" || v === "") ? null : v;
+    info.phone       = clean(info.phone);
+    info.governorate = clean(info.governorate);
+    info.address     = clean(info.address);
+    info.senderName  = clean(info.senderName);
+    info.productCode = clean(info.productCode);
+    info.productName = clean(info.productName);
+
+    // Fix C: override phone/address with pre-extracted session values (prevents old-history pollution)
+    if (overrides?.phone)   { info.phone   = overrides.phone;   console.log(`[BOOKING] Phone override applied: ${overrides.phone}`); }
+    if (overrides?.address) { info.address = overrides.address; console.log(`[BOOKING] Address override applied: ${overrides.address}`); }
+
+    if (!info.phone && !info.address) {
+      console.log(`[BOOKING] Aborting — no phone or address found in conversation`);
+      return;
+    }
+
+    // ── Server-side phone validation (double-check AI validation) ──
+    const PHONE_REGEX = /^(\+9647\d{9}|07\d{9})$/;
+    if (info.phone) {
+      const digits = info.phone.replace(/[\s\-().]/g, "");
+      if (!PHONE_REGEX.test(digits)) {
+        console.log(`[BOOKING] Phone validation failed: "${info.phone}" — skipping booking`);
+        return;
+      }
+    }
+
+    // ── Server-side address validation (at least 2 words/components) ──
+    if (info.address) {
+      const parts = info.address.trim().split(/[\s\-،,\/]+/).filter(Boolean);
+      if (parts.length < 2) {
+        console.log(`[BOOKING] Address too vague: "${info.address}" — skipping booking`);
+        return;
+      }
+    }
+
+    // ── Build booking items ─────────────────────────────────────────────
+    type BookingItem = { code?: string; name: string; quantity: number; unitPrice: number; totalPrice: number; imageUrl?: string };
+    let bookingItems: BookingItem[] = [];
+    let productImageUrl: string | null = null;
+
+    // GPT-extracted single product — lookup in DB by code/name
+    if (bookingItems.length === 0 && (info.productCode || info.productName)) {
+      try {
+        const searchTerm = (info.productCode || info.productName || "").trim();
+        const products = await db.select().from(inventoryTable)
+          .where(or(
+            ilike(inventoryTable.code, `%${searchTerm}%`),
+            ilike(inventoryTable.name, `%${searchTerm}%`),
+          ))
+          .limit(1);
+        const product = products[0];
+        const qty = Math.max(1, Number(info.quantity) || 1);
+
+        // DB price is authoritative; GPT price is fallback (handle "30" vs "30000" ambiguity)
+        let price = 0;
+        if (product?.price) {
+          price = Number(product.price);
+        } else if (info.unitPrice) {
+          const raw = Number(info.unitPrice);
+          // If GPT returned shorthand like "30" instead of "30000", multiply
+          price = raw > 0 && raw < 1000 ? raw * 1000 : raw;
+        }
+
+        console.log(`[BOOKING] Product lookup "${searchTerm}" → ${product ? `found: ${product.name} (${product.code}) price=${price}` : "NOT found in DB"}`);
+
+        bookingItems = [{
+          code: product?.code ?? info.productCode ?? undefined,
+          name: product?.name ?? info.productName ?? "منتج غير محدد",
+          quantity: qty,
+          unitPrice: price,
+          totalPrice: qty * price,
+          imageUrl: product?.publicImageUrl ?? undefined,
+        }];
+        if (product?.publicImageUrl) productImageUrl = product.publicImageUrl;
+      } catch (pErr: any) {
+        console.log(`[BOOKING] Product lookup error: ${pErr?.message}`);
+      }
+    }
+
+    // Priority 3: if still no items but have phone+address, create booking with unknown product
+    if (bookingItems.length === 0) {
+      console.log(`[BOOKING] No product identified — creating booking with unknown item`);
+      bookingItems = [{ name: "منتج غير محدد", quantity: 1, unitPrice: 0, totalPrice: 0 }];
+    }
+
+    // ── Calculate total ─────────────────────────────────────────────────
+    const totalAmount = bookingItems.reduce((sum, it) => sum + it.totalPrice, 0);
+
+    // ── Generate receipt text and save to disk ──────────────────────────
+    let receiptImageUrl: string | null = null;
+    try {
+      const receiptsDir = join(process.cwd(), "public", "uploads", "receipts");
+      await mkdir(receiptsDir, { recursive: true });
+
+      const ts = Date.now();
+      const receiptName = `receipt-${ts}.txt`;
+      const receiptPath = join(receiptsDir, receiptName);
+
+      const itemLines = bookingItems.map((it, i) =>
+        `${i + 1}. ${it.name}${it.code ? ` (${it.code})` : ""} — ${formatShorthandPrice(it.unitPrice)} ألف × ${it.quantity} = ${formatShorthandPrice(it.totalPrice)} ألف`,
+      ).join("\n");
+
+      const imageLinks = bookingItems
+        .filter(it => it.imageUrl)
+        .map((it, i) => `صورة ${i + 1}: ${it.imageUrl}`)
+        .join("\n");
+
+      const receiptText = [
+        "══════════════════════════════",
+        "         SONBOLA - فاتورة طلب",
+        "══════════════════════════════",
+        `الاسم   : ${info.senderName || "—"}`,
+        `الهاتف  : ${info.phone || "—"}`,
+        `المحافظة: ${info.governorate || "—"}`,
+        `العنوان : ${info.address || "—"}`,
+        `المنصة  : ${platform}`,
+        "──────────────────────────────",
+        "المنتجات:",
+        itemLines || "—",
+        "──────────────────────────────",
+        `الإجمالي: ${formatShorthandPrice(totalAmount)} ألف`,
+        "══════════════════════════════",
+        ...(imageLinks ? ["\nروابط الصور:", imageLinks] : []),
+      ].join("\n");
+
+      await writeFile(receiptPath, receiptText, "utf8");
+
+      // Build public URL — use same domain logic as permanent uploads
+      const domains = (process.env.REPLIT_DOMAINS || "").split(",");
+      const primaryDomain = domains[0]?.trim();
+      if (primaryDomain) {
+        receiptImageUrl = `https://${primaryDomain}/uploads/receipts/${receiptName}`;
+      }
+      console.log(`[BOOKING] Receipt saved: ${receiptPath}`);
+    } catch (recErr: any) {
+      console.log(`[BOOKING] Receipt generation failed: ${recErr?.message}`);
+    }
+
+    // ── Fetch customer profile picture (before INSERT so we can save URL) ─
+    const accessTokenForPic = settings?.metaAccessToken || settings?.instagramAccessToken || null;
+    let senderProfilePicUrl: string | null = null;
+    if (accessTokenForPic) {
+      senderProfilePicUrl = await getMetaProfilePic(senderId, accessTokenForPic);
+    }
+
+    // ── Insert booking record ───────────────────────────────────────────
+    const hasFullInfo = !!(info.phone && info.address);
+    const [inserted] = await db.insert(bookingsTable).values({
+      platform,
+      senderId,
+      senderName: info.senderName || null,
+      phoneNumber: info.phone || "غير معروف",
+      governorate: info.governorate || null,
+      fullAddress: info.address || "غير محدد",
+      items: bookingItems,
+      status: "pending",
+      starred: hasFullInfo,
+      totalAmount: totalAmount > 0 ? String(totalAmount) : null,
+      productImageUrl,
+      receiptImageUrl,
+      senderProfilePicUrl,
+    }).returning({ id: bookingsTable.id });
+
+    // Mark conversation as having a booking
+    const convUpdate: Record<string, unknown> = { hasBooking: true, updatedAt: new Date() };
+    if (info.senderName && existing[0] && !existing[0].senderName) {
+      convUpdate.senderName = info.senderName;
+    }
+    await db.update(chatConversationsTable)
+      .set(convUpdate)
+      .where(eq(chatConversationsTable.id, convId));
+
+    console.log(`[BOOKING] Created booking #${inserted?.id} for conv: ${convId} — ${bookingItems.length} items, total: ${totalAmount} profilePic=${!!senderProfilePicUrl}`);
+
+    // ── Telegram notification (media group: profile pic + product images) ──
+    if (settings?.telegramBotToken && settings?.telegramChatId) {
+      const domain = (process.env.REPLIT_DOMAINS || "").split(",")[0]?.trim() || "";
+
+      // ── Vertical price list — NO codes, just name + price ─────────────
+      const verticalLines = bookingItems.map(it =>
+        `${formatShorthandPrice(it.unitPrice * it.quantity)} الف (${it.name})`
+      );
+      if (bookingDeliveryFee > 0) {
+        verticalLines.push(`${formatShorthandPrice(bookingDeliveryFee)} الف توصيل`);
+      }
+      const grandTotal = totalAmount + bookingDeliveryFee;
+      verticalLines.push("──────────");
+      verticalLines.push(`المجموع الكلي: ${formatShorthandPrice(grandTotal)} الف`);
+      const verticalPriceList = verticalLines.join("\n");
+
+      // ── Platform label ────────────────────────────────────────────────
+      const platformLabel = platform === "instagram" ? "INSTAGRAM" : "FACEBOOK";
+
+      const receiptLink = receiptImageUrl
+        ? `🧾 <a href="${receiptImageUrl}">عرض الفاتورة الكاملة</a>` : "";
+
+      // Full booking caption — links are sent as inline buttons separately
+      const caption = [
+        `🌟 <b>STARRED BOOKING ON ${platformLabel}</b>`,
+        "─────────────────────────",
+        `👤 <b>${info.senderName || "زبون"}</b>`,
+        `📞 ${info.phone || "—"}`,
+        `🏙️ ${info.governorate || "—"} — ${info.address || "—"}`,
+        "─────────────────────────",
+        "<b>قايمة الطلبية:</b>",
+        verticalPriceList,
+        "─────────────────────────",
+        ...(receiptLink ? [receiptLink] : []),
+      ].join("\n");
+
+      // ── Collect images for media group ──────────────────────────────────
+      const mediaItems: TelegramMediaItem[] = [];
+
+      // 1. Customer profile picture (first in group)
+      if (senderProfilePicUrl) {
+        const picData = await downloadImageBuffer(senderProfilePicUrl);
+        if (picData) {
+          mediaItems.push({ buffer: picData.buffer, contentType: picData.contentType, label: "profile" });
+        }
+      }
+
+      // 2. Product images (subsequent items) — resolve absolute URLs first
+      for (let i = 0; i < bookingItems.length && i < 8; i++) {
+        const rawUrl = bookingItems[i].imageUrl;
+        if (!rawUrl) continue;
+        const absUrl = rawUrl.startsWith("http") ? rawUrl
+          : domain ? `https://${domain}${rawUrl}` : rawUrl;
+        const imgData = await downloadImageBuffer(absUrl);
+        if (imgData) {
+          mediaItems.push({ buffer: imgData.buffer, contentType: imgData.contentType, label: `prod${i}` });
+        }
+      }
+
+      let tgSent = false;
+
+      if (mediaItems.length > 0) {
+        tgSent = await sendTelegramMediaGroup(
+          settings.telegramBotToken, settings.telegramChatId,
+          mediaItems, caption,
+        );
+        // sendMediaGroup doesn't support reply_markup — send buttons as a follow-up message
+        if (tgSent) {
+          await sendTelegramButtons(settings.telegramBotToken, settings.telegramChatId, senderId);
+        }
+      }
+
+      // Fallback: text-only if all image downloads failed
+      if (!tgSent) {
+        tgSent = await sendTelegramNotification(
+          settings.telegramBotToken, settings.telegramChatId, caption,
+          buildConvButtons(senderId),
+        );
+      }
+
+      // After successful Telegram delivery: star conversation + mark as seen in Meta
+      if (tgSent && settings.metaAccessToken && settings.facebookPageId) {
+        await starMetaConversation(senderId, settings.facebookPageId, settings.metaAccessToken);
+        await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+      }
+    }
+  } catch (err: any) {
+    console.log(`[BOOKING] Failed to auto-create booking: ${err?.message}\n${err?.stack?.slice(0, 400)}`);
+  }
+}
+
+router.get("/webhook/meta", async (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  console.log(`[WEBHOOK VERIFY] mode=${mode} token=${token} challenge=${challenge}`);
+
+  try {
+    const settingsRows = await db.select().from(settingsTable).limit(1);
+    const dbToken = settingsRows[0]?.webhookVerifyToken;
+    const verifyToken = dbToken || process.env.WEBHOOK_VERIFY_TOKEN || "sonbola_verify_secure_2026";
+
+    console.log(`[WEBHOOK VERIFY] dbToken=${dbToken} verifyToken=${verifyToken} match=${token === verifyToken}`);
+
+    if (mode === "subscribe" && token === verifyToken) {
+      res.status(200).send(challenge);
+    } else {
+      console.error(`[WEBHOOK VERIFY] FAILED - token mismatch or wrong mode`);
+      res.sendStatus(403);
+    }
+  } catch (err) {
+    console.error(`[WEBHOOK VERIFY] DB error:`, err);
+    const fallback = process.env.WEBHOOK_VERIFY_TOKEN || "sonbola_verify_secure_2026";
+    if (mode === "subscribe" && token === fallback) {
+      res.status(200).send(challenge);
+    } else {
+      res.sendStatus(403);
+    }
+  }
+});
+
+router.post("/webhook/meta", async (req, res) => {
+  // Acknowledge immediately — Meta requires 200 within 20s
+  res.sendStatus(200);
+
+  try {
+    const body = req.body;
+    if (!body.object) return;
+
+    console.log(`[WH] Received: object=${body.object} entries=${body.entry?.length || 0}`);
+
+    let settings = settingsCache.get();
+    if (!settings) {
+      const rows = await db.select().from(settingsTable).limit(1);
+      settings = rows[0];
+      if (settings) settingsCache.set(settings);
+    }
+    if (!settings) { console.log("[WH] No settings found, skipping"); return; }
+
+    const platform = body.object === "instagram" ? "instagram" : "facebook";
+
+    // Check if bot is enabled for this specific platform
+    const platformEnabled = platform === "instagram"
+      ? (settings.instagramBotEnabled ?? settings.botEnabled)
+      : (settings.facebookBotEnabled ?? settings.botEnabled);
+
+    if (!platformEnabled) {
+      console.log(`[WH] Bot disabled for ${platform}, skipping`);
+      return;
+    }
+
+    // Check scheduler
+    if (settings.schedulerEnabled && !isWithinSchedule(settings.scheduleStart, settings.scheduleEnd)) {
+      console.log("[WH] Outside schedule window, skipping");
+      return;
+    }
+
+    for (const entry of (body.entry || [])) {
+      for (const messagingEvent of (entry.messaging || entry.changes || [])) {
+        const messaging = messagingEvent.value || messagingEvent;
+        if (!messaging.message || messaging.message.is_echo) continue;
+
+        const senderId = messaging.sender?.id || messaging.from?.id;
+        const recipientId = messaging.recipient?.id || messaging.to?.id || null;
+        const messageMid = messaging.message?.mid || null;
+        const messageText = messaging.message?.text || "";
+        const attachments = messaging.message?.attachments || [];
+        // Extract ONLY real product images — strictly ignore stickers, emojis, reactions
+        const rawMetaImageUrl: string | null = (() => {
+          for (const a of attachments) {
+            // ❌ SKIP stickers, reactions, emojis — only real uploaded photos
+            if (a.type === "sticker" || a.sticker_id || a.payload?.sticker_id) continue;
+            if (a.type === "image" && a.payload?.url) return a.payload.url;
+            // Shared post may have subattachments (album / product post)
+            const subs = a.payload?.subattachments?.data || a.subattachments?.data || [];
+            for (const sub of subs) {
+              if (sub.type === "image" && sub.payload?.url) return sub.payload.url;
+            }
+          }
+          return null;
+        })();
+        // ALL real image URLs in this message (preserves send order for vision model)
+        const allImageUrls: string[] = (() => {
+          const urls: string[] = [];
+          for (const a of attachments) {
+            if (a.type === "sticker" || a.sticker_id || a.payload?.sticker_id) continue;
+            if (a.type === "image" && a.payload?.url) urls.push(a.payload.url);
+            const subs = a.payload?.subattachments?.data || a.subattachments?.data || [];
+            for (const sub of subs) {
+              if (sub.type === "image" && sub.payload?.url) urls.push(sub.payload.url);
+            }
+          }
+          return urls;
+        })();
+
+        if (!senderId) { console.log("[WH] No senderId, skipping event"); continue; }
+
+        console.log(`[WH] Message from ${platform}/${senderId}: "${messageText?.slice(0, 60)}" img=${!!rawMetaImageUrl}`);
+
+        // ── Auto-detect Instagram Account ID from webhook recipient field (saved once) ──
+        // The webhook's recipient.id IS the Instagram Business Account ID — save it if missing.
+        if (platform === "instagram" && recipientId && !settings.instagramAccountId) {
+          console.log(`[IG_AUTO] Detected Instagram Account ID from webhook: ${recipientId}`);
+          db.update(settingsTable)
+            .set({ instagramAccountId: recipientId, updatedAt: new Date() })
+            .where(eq(settingsTable.id, settings.id))
+            .catch((e: any) => console.log("[IG_AUTO] Failed to save IG account ID:", e?.message));
+          // Update local settings object so this webhook's reply uses it
+          (settings as any).instagramAccountId = recipientId;
+        }
+
+        // ── Deduplication layer 1: in-memory MID (fast — catches rapid duplicates) ──
+        if (messageMid && inMemoryDuplicate(messageMid)) {
+          console.log(`[DEDUP-MEM] Skipping duplicate mid: ${messageMid}`);
+          continue;
+        }
+
+        // ── Deduplication layer 1b: sender+content fingerprint (catches null-MID duplicates) ──
+        if (!messageMid && inMemoryFingerprintDuplicate(senderId, messageText, !!rawMetaImageUrl)) {
+          console.log(`[DEDUP-FP] Skipping null-MID duplicate from ${senderId}: "${messageText?.slice(0, 40)}"`);
+          continue;
+        }
+
+        // ── Mirror image(s) to permanent storage IMMEDIATELY (Meta URLs expire quickly) ──
+        // Must happen outside queueForSender so we don't wait for prior messages to process.
+        let _mirroredImage: { permanentUrl: string; base64: string; contentType: string } | null = null;
+        if (rawMetaImageUrl) {
+          _mirroredImage = await mirrorMetaImage(rawMetaImageUrl);
+        }
+
+        const convId = `${platform}_${senderId}`;
+
+        // ── Queue per sender: all processing after dedup is serialized per sender ──
+        // This prevents concurrent AI calls/double-replies for the same user.
+        // Capture variables needed inside the closure.
+        const _convId = convId, _senderId = senderId, _messageMid = messageMid;
+        const _messageText = messageText, _platform = platform;
+        const _settings = settings;
+        queueForSender(convId, async () => {
+        const senderId = _senderId, messageMid = _messageMid;
+        const messageText = _messageText;
+        // Use permanent URL (or fall back to raw Meta URL if mirroring failed)
+        const imageUrl = _mirroredImage?.permanentUrl || rawMetaImageUrl;
+        const imageBase64 = _mirroredImage?.base64 || null;
+        const imageContentType = _mirroredImage?.contentType || "image/jpeg";
+        const platform = _platform, convId = _convId;
+        const settings = _settings;
+
+        // ── Deduplication layer 2: INSERT with UNIQUE(mid) as idempotency key ──
+        // Done BEFORE conversation upsert so no side-effects (unreadCount etc.) happen twice.
+        // PostgreSQL unique constraint on mid — atomic, race-condition-proof.
+        try {
+          await db.insert(chatMessagesTable).values({
+            id: randomUUID(),
+            conversationId: convId,
+            role: "user",
+            content: messageText || "[image]",
+            imageUrl,
+            mid: messageMid || undefined,
+          });
+        } catch (insertErr: any) {
+          const isDuplicate =
+            insertErr?.code === "23505" || // PostgreSQL unique violation
+            insertErr?.message?.includes("unique") ||
+            insertErr?.message?.includes("UNIQUE") ||
+            insertErr?.message?.toLowerCase().includes("duplicate");
+          if (isDuplicate && messageMid) {
+            console.log(`[DEDUP-DB] Skipping duplicate mid (unique constraint): ${messageMid}`);
+            return; // deduplicated — skip this message
+          }
+          throw insertErr; // Re-throw unexpected errors
+        }
+
+        // Upsert conversation — only after message insert succeeds (not a duplicate)
+        const existing = await db.select().from(chatConversationsTable).where(eq(chatConversationsTable.id, convId));
+        if (existing.length === 0) {
+          await db.insert(chatConversationsTable).values({
+            id: convId,
+            platform,
+            senderId,
+            lastMessage: messageText,
+            lastMessageAt: new Date(),
+            status: "active",
+            hasBooking: false,
+            isEscalated: false,
+          });
+        } else {
+          await db.update(chatConversationsTable).set({
+            lastMessage: messageText,
+            lastMessageAt: new Date(),
+            unreadCount: (existing[0].unreadCount || 0) + 1,
+            updatedAt: new Date(),
+          }).where(eq(chatConversationsTable.id, convId));
+        }
+
+        // ── Safety lock: skip bot processing for escalated conversations ──────
+        // isEscalated means admin has taken over — do not send automated replies.
+        // EXCEPTION: if the sender has an active booking/image session in memory,
+        // the bot must NOT ignore them — they may be in the middle of completing an order.
+        const isEscalatedConv = existing[0]?.isEscalated ?? false;
+
+        if (isEscalatedConv || deactivatedSenders.has(senderId)) {
+          if (!deactivatedSenders.has(senderId)) deactivatedSenders.add(senderId);
+          console.log(`[BOT] ADMIN MODE — skipping automated reply for ${senderId}`);
+          if (settings.metaAccessToken && settings.facebookPageId) {
+            await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+          }
+          return;
+        }
+
+        // ── Maintenance mode gate: pause ALL bot responses ─────────────────────
+        if (settings.maintenanceMode) {
+          console.log(`[BOT] MAINTENANCE MODE — skipping reply for ${senderId}`);
+          if (settings.metaAccessToken && settings.facebookPageId) {
+            await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+          }
+          return;
+        }
+
+        // ── Work-hours gate: 08:00–23:59 Baghdad (UTC+3) ──────────────────────
+        if (!isBotActiveHours()) {
+          const lastSent = offHoursSentAt.get(senderId) || 0;
+          if (Date.now() - lastSent > 3 * 3600_000) { // max once per 3h per sender
+            offHoursSentAt.set(senderId, Date.now());
+            const offMsg =
+              `عيني وقت الدوام خلص 🌙\n` +
+              `الدوام من الساعة 8 صباحاً لحد 12 مساءً\n` +
+              `لو عندج أي استفسار راسليني على الواتساب 😊\n` +
+              `wa.me/${OWNER_WHATSAPP}`;
+            if (settings.metaAccessToken && settings.facebookPageId) {
+              await sendMetaMessage(senderId, settings.facebookPageId, settings.metaAccessToken,
+                offMsg, platform, settings.instagramAccountId, settings.instagramAccessToken);
+              await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+            }
+            await db.insert(chatMessagesTable).values({
+              id: randomUUID(), conversationId: convId, role: "assistant", content: offMsg,
+            }).catch(() => {});
+          }
+          return;
+        }
+
+        // ── Message pre-processing ─────────────────────────────────────────────
+        let txt = messageText || "";
+
+        // ── Blacklist check: stop immediately if message contains a forbidden word ─
+        if (txt && settings.blacklistKeywords) {
+          try {
+            const blacklist: string[] = JSON.parse(settings.blacklistKeywords);
+            const normTxtBl = normalizeArabic(txt.toLowerCase());
+            const hit = blacklist.find(w => w && normalizeArabic(w.toLowerCase()).length > 0 && normTxtBl.includes(normalizeArabic(w.toLowerCase())));
+            if (hit) {
+              console.log(`[BLACKLIST] Blocked message from ${senderId} — matched: "${hit}"`);
+              if (settings.metaAccessToken && settings.facebookPageId) {
+                await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+              }
+              return;
+            }
+          } catch {}
+        }
+
+        // ── Slang expansion: translate known dialect words before processing ───
+        if (txt && settings.slangMapper) {
+          try {
+            const slangPairs: Array<{ slang: string; meaning: string }> = JSON.parse(settings.slangMapper);
+            for (const { slang, meaning } of slangPairs) {
+              if (slang && meaning) {
+                const re = new RegExp(slang.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+                txt = txt.replace(re, meaning);
+              }
+            }
+          } catch {}
+        }
+
+        // ── Saved replies priority (STRICT — fires before any AI call) ──────────
+        // Every text message is checked against the saved_replies table first.
+        // Arabic normalisation (alef variants, ya, ta-marbuta, diacritics) ensures
+        // fuzzy matching even when the customer's spelling differs from the keyword.
+        // If a keyword matches → send the saved response AS-IS and return immediately.
+        // Fix 2: Check saved replies even when message has an image — if text caption
+        // matches a keyword, return the saved reply without going to AI.
+        if (txt.length > 0) {
+          const earlySavedReplies = repliesCache.get() ?? await (async () => {
+            const d = await db.select().from(savedRepliesTable)
+              .where(eq(savedRepliesTable.isActive, true))
+              .orderBy(asc(savedRepliesTable.id));
+            repliesCache.set(d);
+            return d;
+          })();
+
+          const matchedReply = getSavedReplyMatch(txt, earlySavedReplies);
+          if (matchedReply) {
+            const isArLang = settings.language !== "en";
+            let savedReplyText = isArLang ? matchedReply.replyAr : matchedReply.replyEn;
+
+            // Dynamic substitution: {أسعار_التوصيل} → actual delivery fees from dashboard settings
+            if (savedReplyText.includes("{أسعار_التوصيل}") || savedReplyText.includes("{delivery_fees}")) {
+              const dlvMap: Record<string, number> = (() => {
+                try { return settings.deliveryFees ? JSON.parse(settings.deliveryFees) : {}; }
+                catch { return {}; }
+              })();
+              const feesList = Object.entries(dlvMap)
+                .map(([p, c]) => `${p}: ${c / 1000} الف`)
+                .join(" | ");
+              savedReplyText = savedReplyText
+                .replace(/\{أسعار_التوصيل\}/g, feesList || "—")
+                .replace(/\{delivery_fees\}/g, feesList || "—");
+            }
+
+            console.log(`[REPLY_MATCH] Found keyword "${matchedReply.matchedKeyword}" → "${matchedReply.titleAr}" — sending saved response`);
+            if (settings.metaAccessToken && settings.facebookPageId) {
+              await sendMetaMessage(senderId, settings.facebookPageId, settings.metaAccessToken,
+                savedReplyText, platform, settings.instagramAccountId, settings.instagramAccessToken);
+              await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+            }
+            await db.insert(chatMessagesTable).values({
+              id: randomUUID(), conversationId: convId, role: "assistant", content: savedReplyText,
+            }).catch(() => {});
+            return;
+          }
+          console.log(`[REPLY_MATCH] No keyword match for: "${txt.slice(0, 60)}" — proceeding to AI`);
+        }
+
+
+        // ── Skip meaningless/punctuation-only messages with no image ──
+        const meaningfulText = messageText.replace(/[\s؟?!.،,،؛;،:\-–—]/g, "").trim();
+        if (!imageUrl && meaningfulText.length === 0) {
+          console.log(`[BOT] Skipping punctuation-only message: "${messageText}" from ${senderId}`);
+          return;
+        }
+
+        // Fetch history — last 100 messages (text + imageUrl) so bot recalls discussed products
+        const historyRaw = await db.select().from(chatMessagesTable)
+          .where(eq(chatMessagesTable.conversationId, convId))
+          .orderBy(asc(chatMessagesTable.createdAt))
+          .limit(100);
+
+        // ── Session Reset Protocol (Anti-Hallucination) ─────────────────────────
+        // If there is a 30-minute+ silence before the current message, treat this
+        // as a brand-new inquiry: clear all in-memory state and trim history so
+        // the bot cannot "carry over" old ages, products, or prices.
+        const SESSION_RESET_MS = 30 * 60 * 1000; // 30 minutes
+        let sessionHistory: typeof historyRaw = historyRaw;
+        let sessionWasReset = false;
+        if (historyRaw.length >= 2) {
+          // Current msg is last in historyRaw (just inserted). Find the gap.
+          const currentMsgTime = historyRaw[historyRaw.length - 1]?.createdAt
+            ? new Date(historyRaw[historyRaw.length - 1].createdAt).getTime()
+            : Date.now();
+          // Find last message before the current one that has a real timestamp
+          const prevMsg = [...historyRaw].reverse().slice(1).find((m: any) => m.createdAt != null);
+          if (prevMsg?.createdAt) {
+            const prevTime = new Date(prevMsg.createdAt).getTime();
+            const gapMs = currentMsgTime - prevTime;
+            if (gapMs >= SESSION_RESET_MS) {
+              console.log(`[SESSION_RESET] ${senderId}: ${Math.round(gapMs / 60000)}min gap detected — wiping in-memory state & trimming history`);
+              sessionWasReset = true;
+              // Clear all pending in-memory state for this sender
+              // Trim history: only keep messages from the new session (after the gap)
+              const gapIndex = historyRaw.findIndex(
+                (m: any) => m.createdAt != null && new Date(m.createdAt).getTime() >= currentMsgTime - 1000,
+              );
+              if (gapIndex > 0) {
+                sessionHistory = historyRaw.slice(gapIndex);
+              }
+            }
+          }
+        }
+
+        // Use DB history; supplement from Meta API only when very sparse (new customer)
+        // Skip Meta API fallback after a session reset — it would bring back old context
+        let history = sessionHistory as any[];
+        if (!sessionWasReset && history.length < 4 && settings.metaAccessToken && settings.facebookPageId) {
+          const metaHistory = await fetchMetaHistory(senderId, settings.facebookPageId, settings.metaAccessToken, platform, 20);
+          if (metaHistory.length > 0) {
+            const dbContentSet = new Set(history.map((h: any) => h.content.trim()));
+            const extras = metaHistory
+              .filter((m: any) => !dbContentSet.has(m.content.trim()))
+              .map((m: any, i: number) => ({
+                id: `meta_${i}`, conversationId: convId,
+                role: m.role, content: m.content,
+                imageUrl: null, createdAt: null, mid: null,
+              }));
+            history = [...extras, ...history];
+          }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // AI — storefront-style logic (same engine as website bot)
+        // ══════════════════════════════════════════════════════════════════
+
+        // Fetch all data (in parallel, cached)
+        const [products, starredBookingsP3, trainingNotesP3, savedRepliesP3] = await Promise.all([
+          (async () => { const c = productsCache.get(); if (c) return c; const d = await db.select().from(inventoryTable).where(eq(inventoryTable.available, true)); productsCache.set(d); return d; })(),
+          (async () => { const c = starredBookingCache.get(); if (c) return c; const d = await db.select({ senderName: bookingsTable.senderName, phoneNumber: bookingsTable.phoneNumber, governorate: bookingsTable.governorate, fullAddress: bookingsTable.fullAddress, platform: bookingsTable.platform }).from(bookingsTable).where(eq(bookingsTable.starred, true)).orderBy(desc(bookingsTable.createdAt)).limit(5); starredBookingCache.set(d); return d; })(),
+          (async () => { const c = notesCache.get(); if (c) return c; const d = await db.select().from(botTrainingNotesTable).where(eq(botTrainingNotesTable.active, true)); notesCache.set(d); return d; })(),
+          (async () => { const c = repliesCache.get(); if (c) return c; const d = await db.select().from(savedRepliesTable).where(eq(savedRepliesTable.isActive, true)).orderBy(asc(savedRepliesTable.id)); repliesCache.set(d); return d; })(),
+        ]);
+
+        // ── Build saved replies context — pre-score by keyword relevance to current message ──
+        // Replies whose triggerKeywords match the incoming text are marked ⭐ (high priority for AI)
+        const msgLower = (messageText || "").toLowerCase();
+        const savedRepliesContext = savedRepliesP3.length > 0
+          ? (() => {
+              const isAr = settings.language === "ar" || settings.language !== "en";
+              const lines = savedRepliesP3.map((r, i) => {
+                const keywords = (r.triggerKeywords || "").split(/[,،\n]/).map((k: string) => k.trim().toLowerCase()).filter(Boolean);
+                const isRelevant = keywords.length > 0 && keywords.some((k: string) => msgLower.includes(k));
+                const star = isRelevant ? "⭐ " : "";
+                const reply = isAr ? r.replyAr : r.replyEn;
+                const title = isAr ? r.titleAr : r.titleEn;
+                const kwNote = keywords.length > 0 ? ` [كلمات: ${keywords.join("، ")}]` : "";
+                return `${star}[${i + 1}] ${title}${kwNote}\n   الرد: ${reply}`;
+              });
+              return `\n\n===الردود المحفوظة (${savedRepliesP3.length} رد — يجب الاختيار منها حصراً)===\n` +
+                lines.join("\n\n") +
+                `\n===نهاية الردود المحفوظة — استخدم الردود ذات ⭐ أولاً لأنها الأنسب للرسالة الحالية===`;
+            })()
+          : "\n\n[تنبيه: لا توجد ردود محفوظة بعد — رد بأسلوب مهذب ومختصر واسأل كيف يمكن مساعدة الزبون]";
+
+        // Build rich text product context with all inventory fields
+        const formatPriceW = (price: any): string => {
+          const n = Number(price);
+          if (isNaN(n) || n === 0) return "غير محدد";
+          if (n < 1000) return `${n}`;
+          const t = n / 1000;
+          return Number.isInteger(t) ? `${t} الف` : `${t.toFixed(1)} الف`;
+        };
+        const buildAgeLabelW = (p: any): string => {
+          try {
+            const ranges = p.ageRanges ? JSON.parse(p.ageRanges) : null;
+            if (Array.isArray(ranges) && ranges.length > 0) {
+              return ranges.map((r: any) => `${r.min} ← ${r.max}`).join(" | ");
+            }
+          } catch {}
+          return `${p.ageMin} ← ${p.ageMax}`;
+        };
+        // Build variant map: parentProductId → array of variant color names
+        const variantMap = new Map<string, string[]>();
+        for (const p of products) {
+          const pAny = p as any;
+          if (pAny.parentProductId) {
+            const existing = variantMap.get(pAny.parentProductId) || [];
+            existing.push(pAny.colorVariantName || pAny.colors || "variant");
+            variantMap.set(pAny.parentProductId, existing);
+          }
+        }
+
+        const productContext = products.map((p, i) => {
+          const pAny = p as any;
+          const variants = variantMap.get(p.productId);
+          const variantNote = variants && variants.length > 0
+            ? ` [+${variants.length} ألوان: ${variants.join(", ")}]`
+            : pAny.parentProductId ? ` [لون: ${pAny.colorVariantName || pAny.colors || "—"} من ${pAny.parentProductId}]` : "";
+          let line =
+            `[${String(i + 1).padStart(2, "0")}] كود: ${p.productId}${variantNote}\n` +
+            `     فئة: ${p.category} | جنس: ${p.gender}\n` +
+            `     أعمار: ${buildAgeLabelW(p)}\n` +
+            `     ألوان: ${pAny.colors || "غير محدد"}\n` +
+            `     سعر: ${formatPriceW(p.price)} | مخزون: ${p.stock} قطعة`;
+          if (p.publicImageUrl) line += `\n     صورة: ${p.publicImageUrl}`;
+          if (p.descriptionAr) line += `\n     ملاحظة: ${p.descriptionAr}`;
+          return line;
+        }).join("\n\n");
+
+        // ── Starred Bookings as AI learning examples (item 8) ──
+        const starredContext = starredBookingsP3.length > 0
+          ? `\n\n===أمثلة حجوزات مؤكدة (نجمة ذهبية — استخدمها لفهم كيف يتم تأكيد الطلبية)===\n` +
+            starredBookingsP3.map((b, i) =>
+              `[${i+1}] الاسم: ${b.senderName || "—"} | الهاتف: ${b.phoneNumber} | المحافظة: ${b.governorate} | العنوان: ${b.fullAddress}`
+            ).join("\n") +
+            `\n===استخدم هذه النماذج لتعلم أسلوب جمع بيانات الطلبية===`
+          : "";
+
+
+        // ── Pre-scan full history to extract known customer info (phone / address) ──
+        // Injected explicitly into the system prompt so the bot never has to ask again
+        const phoneRegex = /(?:(?:\+?964|0)7\d{9})/g;
+        const knownPhones = new Set<string>();
+        const knownAddressParts: string[] = [];
+        // Address-indicator keywords (normalised Arabic — alef variants, ya, ta-marbuta merged)
+        const ADDRESS_KEYWORDS = [
+          "حي","شارع","محله","محل","قرب","بجانب","زقاق","حاره",
+          "بغداد","بصره","موصل","نجف","كربلاء","اربيل","كركوك",
+          "ديالي","سليمانيه","الانبار","واسط","ميسان","ذي قار",
+          "المثني","القادسيه","صلاح الدين","بابل","دهوك","حله",
+          "عماره","ناصريه","سماوه","كوت","عكد الكفل",
+          // sub-districts / neighbourhoods common in orders:
+          "كسنزان","عنكاوا","شقلاوه","رانيه","دربنديخان","شهربازار",
+          "زاخو","عقره","الحمدانيه","بيجي","تكريت","سامراء",
+        ];
+        for (const m of history) {
+          if (m.role !== "user") continue;
+          const phones = m.content.match(phoneRegex);
+          if (phones) phones.forEach((p: string) => knownPhones.add(p.trim()));
+          const normContent = normalizeArabic(m.content);
+          if (normContent.length > 5 && ADDRESS_KEYWORDS.some(kw => normContent.includes(kw))) {
+            knownAddressParts.push(m.content.trim());
+          }
+        }
+
+        // ── Province + shipping cost detection ──────────────────────────────────
+        const deliveryFeesMap: Record<string, number> = (() => {
+          try { return settings.deliveryFees ? JSON.parse(settings.deliveryFees) : {}; }
+          catch { return {}; }
+        })();
+        // Scan full history (user messages only) for province mention
+        const detectedProvince = extractProvince(history);
+        const shippingCost = getShippingCost(detectedProvince, deliveryFeesMap);
+
+        // Filter out internal __days_ metadata keys from the fees map
+        const deliveryFeesOnly = Object.fromEntries(
+          Object.entries(deliveryFeesMap).filter(([k]) => !k.startsWith("__days_"))
+        );
+        // Delivery days lookup: map province → days string via group membership
+        const daysIqliym = (deliveryFeesMap as any)["__days_iqliym"] as string | undefined;
+        const daysZakho  = (deliveryFeesMap as any)["__days_zakho"]  as string | undefined;
+        const daysRest   = (deliveryFeesMap as any)["__days_rest"]   as string | undefined;
+        const iqliymProvinces = ["كركوك","أربيل","دهوك","حلبجة"];
+        function getDaysForProvince(prov: string | null): string | null {
+          if (!prov) return null;
+          if (prov === "زاخو") return daysZakho || null;
+          if (iqliymProvinces.some(ip => prov.includes(ip) || ip.includes(prov))) return daysIqliym || null;
+          return daysRest || null;
+        }
+
+        // Build shipping cost section injected into system prompt
+        let shippingSection = "";
+        if (shippingCost !== null && detectedProvince) {
+          const costK = shippingCost / 1000;
+          const daysStr = getDaysForProvince(detectedProvince);
+          const daysNote = daysStr ? ` | مدة الوصول: ${daysStr}` : "";
+          shippingSection = `\n\n🚚 سعر التوصيل لمحافظة "${detectedProvince}": ${costK} الف${daysNote}.` +
+            `\nعند إتمام الحجز: أخبر الزبون بالمجموع الكلي = سعر المنتج + ${costK} الف توصيل.`;
+        } else if (Object.keys(deliveryFeesOnly).length > 0) {
+          // Inject group summary so AI can answer if asked
+          const groupLines: string[] = [];
+          if (daysIqliym) groupLines.push(`محافظات الإقليم (كركوك، أربيل، دهوك، حلبجة): ${(deliveryFeesOnly["كركوك"] ?? 5000) / 1000} الف — ${daysIqliym}`);
+          if (daysZakho)  groupLines.push(`زاخو: ${(deliveryFeesOnly["زاخو"] ?? 3000) / 1000} الف — ${daysZakho}`);
+          if (daysRest)   groupLines.push(`باقي المحافظات: ${(deliveryFeesOnly["بغداد"] ?? 6000) / 1000} الف — ${daysRest}`);
+          const fallbackList = groupLines.length > 0 ? groupLines.join("\n") :
+            Object.entries(deliveryFeesOnly).map(([p, c]) => `${p}: ${c / 1000} الف`).join(" | ");
+          shippingSection = `\n\n🚚 أسعار التوصيل:\n${fallbackList}\nعندما يذكر الزبون محافظته، أخبره بسعر التوصيل ومدة الوصول.`;
+        }
+        // If no province in deliveryFees → request Telegram alert once per conversation
+        if (detectedProvince && shippingCost === null && Object.keys(deliveryFeesMap).length > 0) {
+          if (settings.telegramBotToken && settings.telegramChatId) {
+            sendTelegramNotification(settings.telegramBotToken, settings.telegramChatId,
+              `⚠️ محافظة غير مسجلة في جدول التوصيل\nالمحافظة: "${detectedProvince}"\nالزبون: ${senderId}\nيرجى إضافة سعر التوصيل لهذه المحافظة في الداشبورد.`
+            ).catch(() => {});
+          }
+        }
+
+        const knownInfoSection = (knownPhones.size > 0 || knownAddressParts.length > 0)
+          ? `\n\n📋 معلومات الزبون المستخرجة من المحادثة (استخدمها مباشرةً — لا تطلبها مجدداً):\n` +
+            (knownPhones.size > 0 ? `- رقم الهاتف: ${[...knownPhones].join(" / ")}\n` : "") +
+            (knownAddressParts.length > 0 ? `- تفاصيل العنوان المذكورة: "${knownAddressParts[knownAddressParts.length - 1]}"\n` : "")
+          : "";
+
+        // ── P1 text-only keyword match — reply immediately, no AI cost ──────
+        if (!imageUrl && txt.length > 0) {
+          const p1Match = getSavedReplyMatch(txt, savedRepliesP3);
+          if (p1Match) {
+            let p1Reply = p1Match.replyAr || p1Match.replyEn || "";
+            // Dynamic substitution for delivery fees
+            if (p1Reply.includes("{أسعار_التوصيل}") || p1Reply.includes("{delivery_fees}")) {
+              const dlvMap: Record<string, number> = (() => { try { return settings.deliveryFees ? JSON.parse(settings.deliveryFees) : {}; } catch { return {}; } })();
+              const feesList = Object.entries(dlvMap).map(([p, c]) => `${p}: ${c / 1000} الف`).join(" | ");
+              p1Reply = p1Reply.replace(/\{أسعار_التوصيل\}/g, feesList || "—").replace(/\{delivery_fees\}/g, feesList || "—");
+            }
+            console.log(`[P1_MATCH] Keyword "${p1Match.matchedKeyword}" → "${p1Match.titleAr}" — early return`);
+            if (settings.metaAccessToken && settings.facebookPageId) {
+              await sendMetaMessage(senderId, settings.facebookPageId, settings.metaAccessToken, p1Reply, platform, settings.instagramAccountId, settings.instagramAccessToken);
+              await markMetaSeen(senderId, settings.facebookPageId, settings.metaAccessToken).catch(() => {});
+            }
+            await db.insert(chatMessagesTable).values({ id: randomUUID(), conversationId: convId, role: "assistant", content: p1Reply }).catch(() => {});
+            return;
+          }
+        }
+
+        // ── Build storefront-style system prompt ──────────────────────────────
+        const fmtPriceW2 = (n: any) => { const v = Number(n); if (!v || isNaN(v)) return "غير محدد"; return v >= 1000 ? `${(v / 1000).toFixed(0)} الف` : `${v}`; };
+
+        const productListSimple = products.map(p => {
+          const pa = p as any;
+          let ages = `${pa.ageMin ?? "—"}-${pa.ageMax ?? "—"}`;
+          try { const r = pa.ageRanges ? JSON.parse(pa.ageRanges) : null; if (Array.isArray(r) && r.length > 0) ages = r.map((x: any) => `${x.min}-${x.max}`).join("،"); } catch {}
+          let line = `كود: ${p.productId} | ${p.category} | ${p.gender} | سعر: ${fmtPriceW2(p.price)} | أعمار: ${ages} سنة`;
+          if (pa.colors) line += ` | ألوان: ${pa.colors}`;
+          if (p.publicImageUrl) line += " ✓صورة";
+          return line;
+        }).join("\n");
+
+        const savedRepliesSimple = savedRepliesP3
+          .map((r, i) => `${i + 1}. "${r.titleAr}" → "${r.replyAr}"`)
+          .join("\n");
+
+        const deliveryFeesMap2: Record<string, any> = (() => { try { return settings.deliveryFees ? JSON.parse(settings.deliveryFees) : {}; } catch { return {}; } })();
+        const deliveryFeesOnly2 = Object.fromEntries(Object.entries(deliveryFeesMap2).filter(([k]) => !k.startsWith("__days_")));
+        const dI2 = deliveryFeesMap2["__days_iqliym"] as string | undefined;
+        const dZ2 = deliveryFeesMap2["__days_zakho"]  as string | undefined;
+        const dR2 = deliveryFeesMap2["__days_rest"]   as string | undefined;
+        const deliveryBlock = Object.keys(deliveryFeesOnly2).length > 0
+          ? (() => {
+              const lines: string[] = [];
+              if (deliveryFeesOnly2["كركوك"]) lines.push(`الإقليم (كركوك/أربيل/دهوك/حلبجة): ${fmtPriceW2(deliveryFeesOnly2["كركوك"])}${dI2 ? ` — ${dI2}` : ""}`);
+              if (deliveryFeesOnly2["زاخو"])  lines.push(`زاخو: ${fmtPriceW2(deliveryFeesOnly2["زاخو"])}${dZ2 ? ` — ${dZ2}` : ""}`);
+              if (deliveryFeesOnly2["بغداد"]) lines.push(`باقي المحافظات: ${fmtPriceW2(deliveryFeesOnly2["بغداد"])}${dR2 ? ` — ${dR2}` : ""}`);
+              if (lines.length === 0) lines.push(...Object.entries(deliveryFeesOnly2).map(([p, c]) => `${p}: ${fmtPriceW2(c)}`));
+              return "\n\n━━━ أسعار التوصيل ━━━\n" + lines.join("\n") + "\nعند سؤال عن توصيل محافظة: أجب بسعرها ومدة الوصول. إذا لم تُذكر المحافظة اسأل عنها.";
+            })()
+          : "";
+
+        const trainingBlock = trainingNotesP3.length > 0
+          ? "\n\n━━━ ملاحظات التدريب (أولوية عليا) ━━━\n" + trainingNotesP3.map((n, i) => `${i + 1}. ${n.note}`).join("\n")
+          : "";
+
+        // Extract known phone/address from history
+        const phoneRe2 = /(?:\+9647|07)\d{9}/g;
+        const knownPhones2 = new Set<string>();
+        const knownAddr2: string[] = [];
+        const addrKws2 = ["بغداد","بصره","موصل","نجف","كربلاء","اربيل","كركوك","ديالي","سليمانيه","الانبار","واسط","ميسان","دهوك","حله","تكريت","زاخو","شارع","حي","محله","زقاق"];
+        for (const m of history) {
+          if (m.role !== "user") continue;
+          const phones = m.content.match(phoneRe2); if (phones) phones.forEach((p: string) => knownPhones2.add(p));
+          const normC = m.content.replace(/[أإآ]/g,"ا").replace(/ة/g,"ه").toLowerCase();
+          if (addrKws2.some(k => normC.includes(k))) knownAddr2.push(m.content.trim());
+        }
+        const knownInfoBlock2 = (knownPhones2.size > 0 || knownAddr2.length > 0)
+          ? "\n\n📋 معلومات الزبون من المحادثة (لا تطلبها مجدداً):\n" +
+            (knownPhones2.size > 0 ? `- الهاتف: ${[...knownPhones2].join(" / ")}\n` : "") +
+            (knownAddr2.length > 0 ? `- العنوان: "${knownAddr2[knownAddr2.length - 1]}"\n` : "")
+          : "";
+
+        const customInstructions = settings.systemPromptOverride?.trim()
+          ? settings.systemPromptOverride.trim()
+          : "";
+
+        const systemPrompt = `${customInstructions}
+
+━━━ ملاحظة تقنية (لا تذكرها للزبون) ━━━
+إذا سأل الزبون عن منتج وكان في قائمة المخزون ✓صورة → أضف [SEND_PRODUCTS:الكود] في نهاية ردك فقط (مثال: [SEND_PRODUCTS:S391]).
+يمكنك إرسال حتى 3 صور: [SEND_PRODUCTS:S391,S384,S395]
+الأسعار والأعمار تُؤخذ من قائمة المخزون فقط.
+${trainingBlock}
+━━━ الردود المحفوظة ━━━
+${savedRepliesSimple || "لا توجد ردود محفوظة."}
+${deliveryBlock}${knownInfoBlock2}
+
+━━━ المنتجات المتاحة (${products.length} موديل) ━━━
+${productListSimple || "المخزون فارغ حالياً."}`;
+
+        const messages: any[] = [
+          { role: "system", content: systemPrompt },
+        ];
+
+        // ── Vision context: ONLY load product images when user sends an image ──
+        // Use publicImageUrl (CDN) so GPT can actually access them. imageUrl is private storage.
+        // D: Vision — compare customer photo against inventory thumbnails to identify Model ID
+        const productsWithImages = products.filter(p => p.publicImageUrl);
+        if (imageUrl && productsWithImages.length > 0) {
+          const visionContent: any[] = [
+            {
+              type: "text",
+              text: settings.language === "en"
+                ? `Inventory reference images (${productsWithImages.length} items). Compare the customer's photo against these to identify the closest matching product code:`
+                : `صور مرجعية من المخزون (${productsWithImages.length} منتج). قارن صورة الزبون مع هذه الصور لتحديد الكود الأقرب تطابقاً:`,
+            },
+          ];
+          for (const p of productsWithImages) {
+            const pAny = p as any;
+            const ageLabel = buildAgeLabelW(p);
+            const priceLabel = formatPriceW(p.price);
+            visionContent.push({
+              type: "text",
+              text: `▪ كود: ${p.productId} | ${p.category} | جنس: ${p.gender} | أعمار: ${ageLabel} | سعر: ${priceLabel} | ألوان: ${pAny.colors || "—"}`,
+            });
+            visionContent.push({ type: "image_url", image_url: { url: p.publicImageUrl!, detail: "low" } });
+          }
+          messages.push({ role: "user", content: visionContent });
+          messages.push({
+            role: "assistant",
+            content: settings.language === "en"
+              ? "I've reviewed all inventory images and can identify matching products."
+              : "تم. اطلعت على جميع صور المخزون وجاهز لتحديد المنتج الأقرب لصورة الزبون.",
+          });
+        }
+
+        // Add conversation history (configurable window, defaults to 50)
+        const histWin = settings.historyWindowSize ?? 50;
+        messages.push(
+          ...history.slice(-histWin).map(m => ({
+            role: m.role as "user" | "assistant" | "system",
+            content: m.imageUrl
+              ? [
+                  { type: "text", text: m.content },
+                  { type: "image_url", image_url: { url: m.imageUrl } },
+                ]
+              : m.content,
+          }))
+        );
+
+        // Add current user message
+        if (imageUrl) {
+          // Use base64 data URL when available (avoids OpenAI fetching our storage URL)
+          const visionImageSrc = imageBase64
+            ? `data:${imageContentType};base64,${imageBase64}`
+            : imageUrl;
+          messages.push({
+            role: "user",
+            content: [
+              { type: "text", text: messageText || "شوف الصورة وحدد الموديل المطابق في المخزون وأخبرني بسعره مباشرةً بجملة واحدة." },
+              { type: "image_url", image_url: { url: visionImageSrc, detail: "high" } },
+            ],
+          });
+        } else if (messageText) {
+          messages.push({ role: "user", content: messageText });
+        }
+
+        // ── Model selection: read from DB settings (configurable from Bookings page) ──
+        const model = imageUrl
+          ? (settings.aiModelImage ?? "gpt-4o")
+          : (settings.aiModelText  ?? "gpt-4o-mini");
+        const completion = await openai.chat.completions.create({
+          model,
+          messages,
+          max_completion_tokens: 400,
+          temperature: 0.3,
+          top_p: 0.9,
+        });
+
+        const rawReply = completion.choices[0]?.message?.content || "";
+        const { cleanReply: reply, productIds: sendProductIds } = parseSendProductsTag(rawReply);
+        console.log(`[BOT] Reply to ${senderId}: "${reply.slice(0, 80)}" products=${sendProductIds?.join(",") || "none"}`);
+
+        // Save assistant message
+        await db.insert(chatMessagesTable).values({
+          id: randomUUID(),
+          conversationId: convId,
+          role: "assistant",
+          content: reply,
+        });
+
+        // Send text reply via Meta API
+        if (settings.metaAccessToken && settings.facebookPageId) {
+          await sendMetaMessage(senderId, settings.facebookPageId, settings.metaAccessToken, reply, platform, settings.instagramAccountId, settings.instagramAccessToken);
+        }
+
+        // ── Auto-detect booking confirmation and create booking record ──
+        if (isBookingConfirmation(reply)) {
+          const allMsgs = await db.select({ role: chatMessagesTable.role, content: chatMessagesTable.content })
+            .from(chatMessagesTable)
+            .where(eq(chatMessagesTable.conversationId, convId))
+            .orderBy(asc(chatMessagesTable.createdAt));
+          tryAutoCreateBooking(convId, platform, senderId, allMsgs, settings)
+            .catch(e => console.log(`[BOOKING] tryAutoCreateBooking error: ${e?.message}\n${e?.stack?.slice(0, 300)}`));
+        }
+
+        // ── Auto-detect complaint handover phrase → deactivate bot ──
+        if (isComplaintHandover(reply)) {
+          deactivatedSenders.add(senderId);
+          await db.update(chatConversationsTable).set({ isEscalated: true, status: "admin_required", updatedAt: new Date() }).where(eq(chatConversationsTable.id, convId)).catch(() => {});
+          if (settings.telegramBotToken && settings.telegramChatId) {
+            const lastUserMsg = (messageText || "").slice(0, 200);
+            await sendTelegramNotification(settings.telegramBotToken, settings.telegramChatId,
+              `🚨 [URGENT COMPLAINT] مشكلة قياس/شكوى\n👤 المرسل: ${senderId}\n📱 المنصة: ${platform}\n💬 الرسالة: ${lastUserMsg}\n🔗 المحادثة: ${convId}`,
+              buildConvButtons(senderId),
+            ).catch(() => {});
+          }
+          console.log(`[BOT] Complaint handover detected — deactivated bot for ${senderId}`);
+        }
+
+        // B: Send product image(s) as proper FB/IG media attachments when bot identifies product(s)
+        // No hard limit — send all requested images (bot is instructed to tag up to what's needed)
+        if (sendProductIds && sendProductIds.length > 0 && settings.metaAccessToken && settings.facebookPageId) {
+          let imagesSent = 0;
+          const missingImageCodes: string[] = [];
+          for (const code of sendProductIds) {
+            const matched = products.find(p =>
+              p.productId?.toLowerCase() === code.toLowerCase() ||
+              (p as any).code?.toLowerCase() === code.toLowerCase()
+            );
+            const imgUrl = matched?.publicImageUrl ?? null;
+            if (imgUrl) {
+              try {
+                await sendMetaImage(
+                  senderId,
+                  settings.facebookPageId,
+                  settings.metaAccessToken,
+                  imgUrl,
+                  platform,
+                  settings.instagramAccountId,
+                  settings.instagramAccessToken,
+                );
+                imagesSent++;
+                console.log(`[BOT_IMG] ✓ Sent image ${imagesSent} — code=${code} url=${imgUrl.slice(0, 80)}`);
+                if (imagesSent < sendProductIds.length) {
+                  await new Promise(r => setTimeout(r, 400));
+                }
+              } catch (imgErr: any) {
+                console.log(`[MEDIA_SEND_FAIL] AI [SEND_PRODUCTS] code=${code}: ${imgErr?.message?.slice(0, 200)}`);
+              }
+            } else {
+              console.log(`[BOT_IMG_SKIP] code=${code} — no publicImageUrl in inventory (ensure product has an image uploaded)`);
+              missingImageCodes.push(code);
+            }
+          }
+          if (imagesSent === 0 && sendProductIds.length > 0) {
+            console.log(`[BOT_IMG_WARN] All ${sendProductIds.length} product code(s) [${sendProductIds.join(",")}] had no image — nothing sent to Meta`);
+          }
+          // Rule 4: if any codes had no image → send customer fallback + Telegram admin alert
+          if (missingImageCodes.length > 0) {
+            const fallbackMsg = "عيني لحظات أشيك لج الصور بالمخزن";
+            if (settings.metaAccessToken && settings.facebookPageId) {
+              await sendMetaMessage(
+                senderId, settings.facebookPageId, settings.metaAccessToken,
+                fallbackMsg, platform, settings.instagramAccountId, settings.instagramAccessToken,
+              ).catch(() => {});
+            }
+            if (settings.telegramBotToken && settings.telegramChatId) {
+              await sendTelegramNotification(
+                settings.telegramBotToken, settings.telegramChatId,
+                `⚠️ منتجات بدون صورة في المخزن:\n${missingImageCodes.map(c => `• ${c}`).join("\n")}\n\nالزبون: ${senderId}\nيرجى رفع صور لهذه الموديلات في لوحة التحكم`,
+                buildConvButtons(senderId),
+              ).catch(() => {});
+            }
+          }
+
+        }
+
+        }); // end queueForSender — processing for this message is queued
+      }
+    }
+  } catch (err: any) {
+    console.log("[WH ERROR]", err?.message || String(err), err?.stack?.split('\n').slice(0,3).join(' | '));
+  }
+});
+
+export default router;
